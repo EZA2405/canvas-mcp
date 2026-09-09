@@ -1,0 +1,130 @@
+# Canvas LMS MCP Server
+
+A local MCP server that gives Claude access to your Canvas (Ateneo
+`ateneo.instructure.com`) account: courses, assignments, deadlines, grades,
+announcements, modules, syllabi, **pages, files, discussions, quizzes, calendar,
+and to-do** — plus a small set of **confirm-gated write actions** (submit an
+assignment, post/reply on a discussion, comment on a submission, create a
+planner note).
+
+## ⚠️ Before anything else: rotate your token
+
+If you have ever pasted your token into a chat, treat it as compromised:
+
+1. Canvas → **Account → Settings → Approved Integrations**.
+2. Delete the old token.
+3. **+ New Access Token** → copy the new value.
+4. Put the new value only in the config below — never in chat or in the code.
+
+## How writes stay safe (read this)
+
+Five tools can change things on your Canvas account. Every one of them is gated
+behind a **`confirm` flag that defaults to `False`**:
+
+- Call it normally → it **sends nothing** and returns a *preview* of exactly what
+  it would do (which assignment, due date, your current submission state, an
+  excerpt of the content).
+- Only a second call with **`confirm=true`** actually performs the write.
+
+So a single ambiguous request can never submit homework or post to a class
+discussion under your name by accident. **No tool deletes anything** — deletion
+was deliberately left out.
+
+## Read tools
+
+| Tool | Purpose |
+|------|---------|
+| `canvas_get_profile` | Verify the token / who's connected |
+| `canvas_list_courses` | Active, completed, or all courses with current grades |
+| `canvas_list_assignments` | Assignments for a course + submission status (filter by bucket) |
+| `canvas_get_assignment` | Full detail of one assignment — description, **full rubric (criteria, rating scales, your per-criterion score)**, points |
+| `canvas_list_upcoming` | Everything due in the next N days across all courses |
+| `canvas_get_grades` | Grade summary across courses, or per-assignment scores |
+| `canvas_list_announcements` | Recent announcements, one course or all |
+| `canvas_list_modules` | Course module structure + items (now shows page slugs / content IDs) |
+| `canvas_get_syllabus` | A course's syllabus field as text |
+| `canvas_list_pages` | List wiki Pages (title, slug, page ID) — find syllabi/schedules stored as Pages |
+| `canvas_get_page` | Read a Page's full body as text |
+| `canvas_list_files` | List course files (name, ID, type, size) |
+| `canvas_get_file` | File metadata; inlines text for text-based files, download URL for binaries |
+| `canvas_list_discussions` | List discussion topics in a course |
+| `canvas_get_discussion` | A topic's prompt + full threaded replies |
+| `canvas_list_quizzes` | List quizzes with due dates, points, question counts |
+| `canvas_get_quiz` | Quiz settings + instructions |
+| `canvas_list_calendar_events` | Calendar events or assignment due-dates in a date range |
+| `canvas_list_todo` | Canvas's native to-do list |
+
+## Write tools (confirm-gated)
+
+| Tool | Purpose | Stakes |
+|------|---------|--------|
+| `canvas_create_planner_note` | Create a personal planner note / to-do | Low (private, reversible) |
+| `canvas_submit_assignment` | Submit text, a URL, or uploaded file IDs to an assignment | **High (graded)** |
+| `canvas_post_discussion_entry` | Post a new top-level entry to a discussion | **Public to class** |
+| `canvas_reply_to_entry` | Reply to a specific discussion entry | **Public to class** |
+| `canvas_post_submission_comment` | Comment on your own submission (note to grader) | Medium |
+
+`canvas_submit_assignment` supports `online_text_entry` (`body`), `online_url`
+(`url`), and `online_upload` (`file_ids` — the files must already be uploaded to
+Canvas; this tool does not perform the upload handshake).
+
+## Setup
+
+### 1. Install dependencies (one time)
+
+```bash
+cd canvas-mcp
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+```
+
+(No new dependencies were added — still just `mcp` and `httpx`.)
+
+### 2. Register it with Claude Desktop
+
+> Local stdio MCP servers run through the **Claude Desktop app**, not the
+> claude.ai website. If you're using the web app, install Claude Desktop first.
+
+Open the config file:
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+
+Merge in the block from `claude_desktop_config.example.json`, replacing:
+- `/ABSOLUTE/PATH/TO/canvas-mcp/` with the real absolute path on your machine
+- `PASTE_YOUR_FRESH_TOKEN_HERE` with the new token from the rotation step
+
+Use absolute paths and the venv's Python so dependencies resolve.
+
+### 3. Restart Claude Desktop
+
+Try: *"Use Canvas to read the DECSC 25 syllabus page,"* then *"What's on my
+calendar this week?"*
+
+## Test it manually first (recommended for the write tools)
+
+```bash
+CANVAS_API_TOKEN="your_new_token" \
+CANVAS_BASE_URL="https://ateneo.instructure.com" \
+npx @modelcontextprotocol/inspector ./venv/bin/python canvas_mcp.py
+```
+
+In the Inspector, call a write tool **without** `confirm` first and read the
+preview before ever setting `confirm=true`.
+
+## Config reference
+
+| Env var | Required | Default |
+|---------|----------|---------|
+| `CANVAS_API_TOKEN` | yes | — |
+| `CANVAS_BASE_URL` | no | `https://ateneo.instructure.com` |
+
+## Notes
+
+- Pagination is handled automatically (up to a safety cap).
+- `canvas_list_upcoming` and the planner note tool use the Canvas Planner API; if
+  your instance has it disabled, fall back to `canvas_list_assignments` with
+  `bucket: upcoming`.
+- `canvas_list_calendar_events` caps contexts at 10 per request (a Canvas limit);
+  with many active courses, pass a `course_id` to scope it.
+- Quiz *questions* are generally not retrievable via the API outside an attempt,
+  so `canvas_get_quiz` returns settings and instructions only.

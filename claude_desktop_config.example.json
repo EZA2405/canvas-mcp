@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "canvas": {
+      "command": "/ABSOLUTE/PATH/TO/canvas-mcp/venv/bin/python",
+      "args": [
+        "/ABSOLUTE/PATH/TO/canvas-mcp/canvas_mcp.py"
+      ],
+      "env": {
+        "CANVAS_API_TOKEN": "PASTE_YOUR_FRESH_TOKEN_HERE",
+        "CANVAS_BASE_URL": "https://ateneo.instructure.com"
+      }
+    }
+  }
+}
