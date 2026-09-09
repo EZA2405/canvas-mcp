@@ -28,10 +28,12 @@ import mimetypes
 import os
 import re
 import argparse
+import asyncio
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -51,6 +53,14 @@ REQUEST_TIMEOUT = 30.0
 MAX_PAGES = 20            # safety cap when following pagination links
 DEFAULT_PER_PAGE = 100
 HTML_TEXT_LIMIT = 4000    # truncate long HTML bodies (syllabus, descriptions)
+SWEEP_CONCURRENCY = 8     # cap on simultaneous requests in cross-course sweeps
+                          # (overdue/graded-discussion helpers), to avoid
+                          # bursting Canvas's per-token rate limit on an
+                          # account with many active courses/discussions
+
+LOCAL_TZ_NAME = os.environ.get("CANVAS_TIMEZONE", "Asia/Manila")
+LOCAL_TZ = ZoneInfo(LOCAL_TZ_NAME)
+LOCAL_TZ_LABEL = os.environ.get("CANVAS_TZ_LABEL", "PHT")
 
 mcp = FastMCP("canvas_mcp")
 
@@ -166,12 +176,13 @@ def _strip_html(raw: Optional[str], limit: int = HTML_TEXT_LIMIT) -> str:
 
 
 def _fmt_dt(value: Optional[str]) -> str:
-    """Format an ISO-8601 timestamp from Canvas into a readable string."""
+    """Format an ISO-8601 UTC timestamp from Canvas into local account time."""
     if not value:
         return "—"
     try:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %H:%M UTC")
+        local = dt.astimezone(LOCAL_TZ)
+        return f"{local.strftime('%Y-%m-%d %H:%M')} {LOCAL_TZ_LABEL}"
     except (ValueError, AttributeError):
         return value
 
@@ -203,6 +214,144 @@ def _course_name(c: dict[str, Any]) -> str:
     return c.get("name") or c.get("course_code") or f"Course {c.get('id')}"
 
 
+async def _gather_limited(coros, limit: int = SWEEP_CONCURRENCY):
+    """Like asyncio.gather(*coros, return_exceptions=True), but caps how many
+    run at once — an unbounded fan-out across many courses/topics can burst
+    past Canvas's per-token rate limit."""
+    sem = asyncio.Semaphore(limit)
+
+    async def _bounded(coro):
+        async with sem:
+            return await coro
+
+    return await asyncio.gather(*(_bounded(c) for c in coros), return_exceptions=True)
+
+
+async def _fetch_overdue_assignments(
+    courses: Optional[list[dict[str, Any]]] = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Cross-course sweep for assignments that are overdue and not submitted.
+
+    Deliberately does NOT rely on Canvas's server-side bucket=overdue filter
+    (it has been observed to silently drop on-paper submission types with no
+    online submission). Instead fetches each active course's full assignment
+    list with submission data and filters client-side.
+
+    Returns (rows, skipped_course_names) — one broken course must not fail the
+    whole sweep, but the caller must be able to tell the user it was skipped.
+    """
+    now = _now()
+    if courses is None:
+        courses = await _fetch_courses(enrollment_state="active")
+    out: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    results = await _gather_limited(
+        _paginated_get(f"/courses/{c['id']}/assignments",
+                       {"include[]": ["submission"]}) for c in courses)
+    for c, items in zip(courses, results):
+        if isinstance(items, BaseException):
+            skipped.append(_course_name(c))
+            continue  # one broken course must not fail the whole sweep
+        for a in items:
+            if not isinstance(a, dict):
+                continue
+            due = a.get("due_at")
+            if not due:
+                continue
+            try:
+                due_dt = datetime.fromisoformat(due.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                continue
+            if due_dt >= now:
+                continue
+            sub = a.get("submission") or {}
+            state = sub.get("workflow_state", "unsubmitted")
+            submitted = bool(sub.get("submitted_at"))
+            missing = bool(sub.get("missing"))
+            excused = bool(sub.get("excused"))
+            if excused or submitted:
+                continue
+            if not (missing or state == "unsubmitted"):
+                continue
+            out.append({
+                "id": a.get("id"),
+                "due": due, "type": "assignment",
+                "title": a.get("name") or "(untitled)",
+                "course_id": c["id"], "context": _course_name(c),
+                "points": a.get("points_possible"),
+                "status": "missing" if missing else "not submitted",
+                "html_url": a.get("html_url"),
+            })
+    return out, skipped
+
+
+async def _fetch_graded_discussions(
+    courses: Optional[list[dict[str, Any]]] = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Cross-course sweep for graded discussion topics (lock_at/due_at set),
+    since Canvas's planner and todo endpoints do not reliably surface them.
+
+    Returns (rows, skipped_course_names). A course whose topic list fails to
+    fetch is reported as skipped; a topic whose assignment detail fails only
+    loses its submission status ("—") and is NOT counted as a skipped course.
+    """
+    if courses is None:
+        courses = await _fetch_courses(enrollment_state="active")
+    out: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    results = await _gather_limited(
+        _paginated_get(f"/courses/{c['id']}/discussion_topics", {})
+        for c in courses)
+
+    # Collect every actionable topic first, so the per-topic assignment detail
+    # fetches can be issued concurrently instead of one-at-a-time (N+1).
+    pending: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], str]] = []
+    for c, topics in zip(courses, results):
+        if isinstance(topics, BaseException):
+            skipped.append(_course_name(c))
+            continue
+        for t in topics:
+            if not isinstance(t, dict):
+                continue
+            assignment = t.get("assignment") or {}
+            due = assignment.get("due_at") or t.get("lock_at")
+            if not (assignment.get("id") or t.get("lock_at")):
+                continue  # not graded and not time-boxed — not actionable
+            if not due:
+                continue
+            pending.append((c, t, assignment, due))
+
+    graded_idx = [i for i, (_c, _t, assignment, _due) in enumerate(pending)
+                  if assignment.get("id")]
+    detail_results = await _gather_limited(
+        _get(f"/courses/{pending[i][0]['id']}/assignments"
+             f"/{pending[i][2]['id']}", {"include[]": ["submission"]})
+        for i in graded_idx)
+    details = dict(zip(graded_idx, detail_results))
+
+    for i, (c, t, assignment, due) in enumerate(pending):
+        status = "—"
+        a = details.get(i)
+        if isinstance(a, dict):
+            sub = a.get("submission") or {}
+            if sub.get("submitted_at"):
+                status = "submitted"
+            elif sub.get("missing"):
+                status = "missing"
+            else:
+                status = "not submitted"
+        out.append({
+            "id": assignment.get("id") or t.get("id"),
+            "due": due, "type": "discussion_topic",
+            "title": t.get("title") or "(untitled)",
+            "course_id": c["id"], "context": _course_name(c),
+            "points": assignment.get("points_possible"),
+            "status": status,
+            "html_url": t.get("html_url"),
+        })
+    return out, skipped
+
+
 # --------------------------------------------------------------------------- #
 # Input models
 # --------------------------------------------------------------------------- #
@@ -223,6 +372,21 @@ class ListCoursesInput(_Base):
                     "or 'all'.",
         pattern=r"^(active|completed|all)$",
     )
+    current_term_only: bool = Field(
+        default=False,
+        description="When True, exclude courses whose term has already ended or "
+                    "not yet started (e.g. old PE courses from a prior school "
+                    "year). Courses with no term date bounds (permanent hub "
+                    "sites like a student-conduct or orientation site) are NOT "
+                    "filtered by this flag since there's no date to judge them "
+                    "by — use term_name to exclude those explicitly.",
+    )
+    term_name: Optional[str] = Field(
+        default=None,
+        description="Case-insensitive substring filter on the course's term "
+                    "name (e.g. 'AY 2025-2026 Sem 1'). Use this to pin an exact "
+                    "term when current_term_only isn't precise enough.",
+    )
     response_format: ResponseFormat = Field(
         default=ResponseFormat.MARKDOWN,
         description="'markdown' for a readable summary or 'json' for raw structured data.",
@@ -235,7 +399,10 @@ class ListAssignmentsInput(_Base):
     bucket: Optional[str] = Field(
         default=None,
         description="Optional filter: 'upcoming', 'past', 'overdue', 'unsubmitted', "
-                    "'ungraded', 'undated', or 'future'. Omit for all assignments.",
+                    "'ungraded', 'undated', or 'future'. Omit for all assignments. "
+                    "'unsubmitted' is filtered locally (Canvas's own bucket=unsubmitted "
+                    "drops on-paper submission types), so it also catches assignments "
+                    "with no online submission method.",
         pattern=r"^(upcoming|past|overdue|unsubmitted|ungraded|undated|future)$",
     )
     include_submission: bool = Field(
@@ -254,7 +421,9 @@ class GetAssignmentInput(_Base):
 class UpcomingInput(_Base):
     days_ahead: int = Field(
         default=14,
-        description="How many days forward to look for due items across all courses.",
+        description="How many days forward to look for due items across all courses. "
+                    "Overdue, unsubmitted items are always included regardless of "
+                    "this window.",
         ge=1, le=90,
     )
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN,
@@ -279,8 +448,28 @@ class AnnouncementsInput(_Base):
                     "active courses.",
         ge=1,
     )
+    course_ids: Optional[list[int]] = Field(
+        default=None,
+        description="Optional list of specific course IDs to pull announcements "
+                    "from. When given, this takes precedence over course_id and "
+                    "over sweeping all active courses.",
+    )
+    exclude_course_ids: Optional[list[int]] = Field(
+        default=None,
+        description="Course IDs to exclude from the sweep — useful for "
+                    "permanent hub/orientation sites that generate noisy "
+                    "unrelated announcements (weather notices, etc.) when you "
+                    "sweep all active courses.",
+    )
     days_back: int = Field(default=21, description="How many days back to look.",
                            ge=1, le=180)
+    max_body_chars: int = Field(
+        default=1500, ge=100, le=8000,
+        description="Max characters of each announcement body to include "
+                    "before truncating. Lower this to shrink response size when "
+                    "sweeping many courses; raise it if bodies are getting cut "
+                    "off mid-sentence and you need the full text.",
+    )
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN,
                                             description="'markdown' or 'json'.")
 
@@ -358,6 +547,13 @@ async def canvas_list_courses(params: ListCoursesInput) -> str:
 
     Args:
         params.enrollment_state: 'active', 'completed', or 'all'.
+        params.current_term_only: When True, drop courses whose term has already
+            ended or has not yet started (e.g. old PE courses from a prior school
+            year). Courses whose term has no start/end dates — permanent hub sites
+            like a student-conduct or orientation site — are left in, since there
+            is no date to judge them by; use params.term_name for those.
+        params.term_name: Case-insensitive substring filter on the course's term
+            name (e.g. 'AY 2025-2026 Sem 1') to pin an exact term.
         params.response_format: 'markdown' or 'json'.
 
     Returns:
@@ -370,6 +566,32 @@ async def canvas_list_courses(params: ListCoursesInput) -> str:
             done = await _fetch_courses(enrollment_state="completed")
             seen = {c["id"] for c in courses}
             courses.extend(c for c in done if c["id"] not in seen)
+
+        if params.current_term_only:
+            now = _now()
+
+            def _in_current_term(c: dict[str, Any]) -> bool:
+                term = c.get("term") or {}
+                start, end = term.get("start_at"), term.get("end_at")
+                try:
+                    if start:
+                        start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                        if now < start_dt:
+                            return False
+                    if end:
+                        end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                        if now > end_dt:
+                            return False
+                except (ValueError, AttributeError):
+                    pass
+                return True
+
+            courses = [c for c in courses if _in_current_term(c)]
+
+        if params.term_name:
+            needle = params.term_name.lower()
+            courses = [c for c in courses
+                       if needle in ((c.get("term") or {}).get("name", "") or "").lower()]
 
         if params.response_format == ResponseFormat.JSON:
             slim = [{
@@ -410,6 +632,7 @@ async def canvas_list_assignments(params: ListAssignmentsInput) -> str:
     Args:
         params.course_id: Canvas course ID.
         params.bucket: Optional Canvas bucket filter (upcoming/past/overdue/etc.).
+            'unsubmitted' is filtered client-side rather than server-side.
         params.include_submission: Include submission status and score.
         params.response_format: 'markdown' or 'json'.
 
@@ -418,12 +641,28 @@ async def canvas_list_assignments(params: ListAssignmentsInput) -> str:
              (if requested) submission state, score, late/missing flags.
     """
     try:
+        # Canvas's own bucket=unsubmitted drops on-paper submission types (assignments
+        # with no online submission method), so we filter that one case client-side.
+        local_unsubmitted = params.bucket == "unsubmitted"
         api_params: dict[str, Any] = {"order_by": "due_at"}
-        if params.bucket:
+        if params.bucket and not local_unsubmitted:
             api_params["bucket"] = params.bucket
-        if params.include_submission:
+        if params.include_submission or local_unsubmitted:
             api_params["include[]"] = ["submission"]
         items = await _paginated_get(f"/courses/{params.course_id}/assignments", api_params)
+        if local_unsubmitted:
+            filtered = []
+            for a in items:
+                if not isinstance(a, dict):
+                    continue
+                sub = a.get("submission") or {}
+                if sub.get("excused") or sub.get("submitted_at"):
+                    continue
+                if not (sub.get("missing")
+                        or sub.get("workflow_state", "unsubmitted") == "unsubmitted"):
+                    continue
+                filtered.append(a)
+            items = filtered
 
         if params.response_format == ResponseFormat.JSON:
             slim = [{
@@ -535,16 +774,23 @@ async def canvas_get_assignment(params: GetAssignmentInput) -> str:
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 )
 async def canvas_list_upcoming(params: UpcomingInput) -> str:
-    """List everything due soon across ALL courses (assignments, quizzes, etc.),
-    sorted by due date. This is the 'what do I have coming up' view.
+    """List everything due soon across ALL courses (assignments, quizzes, graded
+    discussions, etc.), sorted by due date. This is the 'what do I have coming up'
+    view.
+
+    Overdue, still-unsubmitted items are ALWAYS swept in and reported in their own
+    section, independent of days_ahead. Graded discussion topics are also swept in,
+    because Canvas's planner does not reliably surface them.
 
     Args:
-        params.days_ahead: Look-ahead window in days (1–90).
+        params.days_ahead: Look-ahead window in days (1–90). Only affects the
+            upcoming section, not the overdue sweep.
         params.response_format: 'markdown' or 'json'.
 
     Returns:
-        str: Consolidated, chronologically sorted list of due items with course,
-             title, due date, points, and submission status.
+        str: Overdue unsubmitted items first, then a consolidated, chronologically
+             sorted list of items due in the window — each with course, title, due
+             date, points, and submission status.
     """
     try:
         start = _now().date()
@@ -569,7 +815,16 @@ async def canvas_list_upcoming(params: UpcomingInput) -> str:
                     status = "missing"
                 else:
                     status = "not submitted"
+            # Graded discussions are keyed by their backing assignment id
+            # everywhere else in this tool (see _fetch_graded_discussions) —
+            # match that here so cross-source dedup actually recognizes the
+            # same item instead of comparing a topic id against an
+            # assignment id.
+            row_id = pl.get("id")
+            if it.get("plannable_type") == "discussion_topic":
+                row_id = pl.get("assignment_id") or row_id
             rows.append({
+                "id": row_id,
                 "due": due,
                 "type": it.get("plannable_type"),
                 "title": pl.get("title") or pl.get("name") or "(untitled)",
@@ -579,23 +834,114 @@ async def canvas_list_upcoming(params: UpcomingInput) -> str:
                 "status": status,
                 "html_url": it.get("html_url"),
             })
+
+        def _key(r: dict[str, Any]) -> tuple[Any, Any, Any]:
+            rid = r.get("id")
+            if rid is not None:
+                return (r.get("course_id"), "id", rid)
+            return (r.get("course_id"), r.get("title"), r.get("due"))
+
+        def _due_dt(value: Optional[str]) -> Optional[datetime]:
+            if not value:
+                return None
+            try:
+                dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                return None
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+        # Always sweep overdue items — the planner window alone hides them.
+        # Both sweeps need the same course list and are independent of each
+        # other, so fetch the list once and run them concurrently.
+        courses = await _fetch_courses(enrollment_state="active")
+        (overdue_raw, overdue_skipped), (discussions, disc_skipped) = \
+            await asyncio.gather(_fetch_overdue_assignments(courses),
+                                 _fetch_graded_discussions(courses))
+        overdue = [r for r in overdue_raw
+                   if _key(r) not in {_key(x) for x in rows}]
+        skipped = list(dict.fromkeys(overdue_skipped + disc_skipped))
+
+        # Graded discussions: split into overdue vs in-window, merge into both lists.
+        now = _now()
+        for d in discussions:
+            d_dt = _due_dt(d["due"])
+            if d_dt is None:
+                continue
+            if d_dt < now and d["status"] in ("missing", "not submitted"):
+                if _key(d) not in {_key(x) for x in rows} | {_key(x) for x in overdue}:
+                    overdue.append(d)
+            elif start <= d_dt.date() <= end:
+                if _key(d) not in {_key(x) for x in rows}:
+                    rows.append(d)
+
+        overdue.sort(key=lambda r: r["due"] or "9999")
         rows.sort(key=lambda r: r["due"] or "9999")
 
         if params.response_format == ResponseFormat.JSON:
             return json.dumps({"window_days": params.days_ahead, "count": len(rows),
-                               "items": rows}, indent=2)
-        if not rows:
-            return (f"Nothing due in the next {params.days_ahead} days "
-                    "(or the planner is unavailable on this Canvas instance).")
-        lines = [f"**{len(rows)} item(s) due in the next {params.days_ahead} days:**\n"]
-        for r in rows:
+                               "items": rows, "overdue": overdue,
+                               "skipped_courses": skipped}, indent=2)
+
+        def _render(r: dict[str, Any]) -> str:
             pts = f", {r['points']} pts" if r["points"] is not None else ""
             ctx = r["context"] or (f"course {r['course_id']}" if r["course_id"] else "")
-            lines.append(f"- **{_fmt_dt(r['due'])}** — {r['title']} "
-                         f"[{r['type']}]{pts}\n    {ctx} · {r['status']}")
+            return (f"- **{_fmt_dt(r['due'])}** — {r['title']} "
+                    f"[{r['type']}]{pts}\n    {ctx} · {r['status']}")
+
+        note = ""
+        if skipped:
+            note = (f"_(Note: could not check {', '.join(skipped)} — you may be "
+                    f"missing items from "
+                    f"{'this course' if len(skipped) == 1 else 'these courses'}.)_")
+        if not rows and not overdue:
+            empty = (f"Nothing overdue, and nothing due in the next "
+                     f"{params.days_ahead} days.")
+            return f"{note}\n\n{empty}" if note else empty
+        lines: list[str] = []
+        if note:
+            lines.append(note + "\n")
+        if overdue:
+            lines.append(f"## ⚠️ Overdue (not submitted)\n"
+                         f"**{len(overdue)} item(s) past due:**\n")
+            lines.extend(_render(r) for r in overdue)
+            lines.append("")
+        if rows:
+            lines.append(
+                f"**{len(rows)} item(s) due in the next {params.days_ahead} days:**\n")
+            lines.extend(_render(r) for r in rows)
+        else:
+            lines.append(f"Nothing else due in the next {params.days_ahead} days.")
         return "\n".join(lines)
     except Exception as e:  # noqa: BLE001
         return _handle_api_error(e)
+
+
+async def _aggregate_course_score(course_id: int) -> Optional[tuple[float, float, int]]:
+    """Best-effort fallback grade estimate: sum(earned)/sum(possible) over graded
+    submissions only. Returns (earned, possible, graded_count) or None if nothing
+    graded yet. This is an unweighted approximation — it ignores assignment group
+    weighting — used only when Canvas's own computed course score is hidden."""
+    try:
+        items = await _paginated_get(
+            f"/courses/{course_id}/assignments", {"include[]": ["submission"]})
+    except Exception:  # noqa: BLE001
+        return None
+    earned = possible = 0.0
+    n = 0
+    for a in items:
+        if not isinstance(a, dict):
+            continue
+        sub = a.get("submission") or {}
+        score = sub.get("score")
+        pts = a.get("points_possible")
+        if score is None or pts is None:
+            continue
+        earned += score
+        possible += pts
+        n += 1
+    if n == 0 or possible <= 0:
+        return None
+    return (earned, possible, n)
 
 
 @mcp.tool(
@@ -613,6 +959,8 @@ async def canvas_get_grades(params: GradesInput) -> str:
 
     Returns:
         str: Grade summary (per course) or scored assignment list (per course).
+             In the summary, courses whose computed score is hidden by the
+             instructor show an unweighted estimate derived from graded items.
     """
     try:
         if params.course_id is None:
@@ -621,7 +969,18 @@ async def canvas_get_grades(params: GradesInput) -> str:
                 "course_id": c["id"], "name": _course_name(c),
                 "current_score": c.get("computed_current_score"),
                 "current_grade": c.get("computed_current_grade"),
+                "estimated_score": None,
+                "estimated_from_count": None,
             } for c in courses]
+            # Some institutions hide the computed course score; fall back to an
+            # unweighted average of whatever individual submissions are graded.
+            for s in summary:
+                if s["current_score"] is None and s["current_grade"] is None:
+                    agg = await _aggregate_course_score(s["course_id"])
+                    if agg:
+                        earned, possible, n = agg
+                        s["estimated_score"] = round(earned / possible * 100, 1)
+                        s["estimated_from_count"] = n
             if params.response_format == ResponseFormat.JSON:
                 return json.dumps({"count": len(summary), "grades": summary}, indent=2)
             if not summary:
@@ -629,7 +988,13 @@ async def canvas_get_grades(params: GradesInput) -> str:
             lines = ["**Current grades (active courses):**\n"]
             for s in summary:
                 sc, gr = s["current_score"], s["current_grade"]
-                val = f"{gr or ''} ({sc}%)" if sc is not None else "no grade posted"
+                if sc is not None:
+                    val = f"{gr or ''} ({sc}%)"
+                elif s["estimated_score"] is not None:
+                    val = (f"~{s['estimated_score']:.1f}% (estimated from "
+                           f"{s['estimated_from_count']} graded item(s), unweighted)")
+                else:
+                    val = "no grade posted"
                 lines.append(f"- **{s['name']}** (ID {s['course_id']}): {val}")
             return "\n".join(lines)
 
@@ -677,20 +1042,37 @@ async def canvas_list_announcements(params: AnnouncementsInput) -> str:
 
     Args:
         params.course_id: Optional course ID (omit for all active courses).
+        params.course_ids: Optional explicit list of course IDs. When given it
+            takes precedence over params.course_id and over the all-active sweep.
+        params.exclude_course_ids: Course IDs to drop from the all-active sweep.
+            This is the way to keep permanent hub sites (e.g. a SERVIRE/weather-
+            notice site, Student Conduct, Passport to Canvas) out of a broad
+            sweep — they post frequent announcements unrelated to coursework.
         params.days_back: How far back to look (1–180 days).
+        params.max_body_chars: Max characters of each announcement body before
+            truncation (100–8000). Lower it to shrink a wide sweep's response.
         params.response_format: 'markdown' or 'json'.
 
     Returns:
         str: Announcements with course, title, posted date, and plain-text body.
     """
     try:
-        if params.course_id is not None:
+        if params.course_ids:
+            context_codes = [f"course_{cid}" for cid in params.course_ids]
+            id_to_name = {cid: f"course {cid}" for cid in params.course_ids}
+        elif params.course_id is not None:
             context_codes = [f"course_{params.course_id}"]
             id_to_name = {params.course_id: f"course {params.course_id}"}
         else:
             courses = await _fetch_courses(enrollment_state="active")
             context_codes = [f"course_{c['id']}" for c in courses]
             id_to_name = {c["id"]: _course_name(c) for c in courses}
+            if params.exclude_course_ids:
+                excluded = set(params.exclude_course_ids)
+                context_codes = [f"course_{cid}" for cid in id_to_name
+                                 if cid not in excluded]
+                id_to_name = {cid: name for cid, name in id_to_name.items()
+                              if cid not in excluded}
             if not context_codes:
                 return "No active courses to read announcements from."
 
@@ -720,7 +1102,7 @@ async def canvas_list_announcements(params: AnnouncementsInput) -> str:
                 "title": a.get("title"),
                 "posted_at": a.get("posted_at") or a.get("created_at"),
                 "url": a.get("html_url"),
-                "body": _strip_html(a.get("message"), limit=1500),
+                "body": _strip_html(a.get("message"), limit=params.max_body_chars),
             })
         parsed.sort(key=lambda r: r["posted_at"] or "", reverse=True)
 
@@ -807,8 +1189,25 @@ async def canvas_get_syllabus(params: SyllabusInput) -> str:
                        {"include[]": ["syllabus_body"]})
         body = _strip_html(c.get("syllabus_body"), limit=8000)
         if not body:
-            return (f"No syllabus content is published for "
-                    f"**{_course_name(c)}** (ID {params.course_id}).")
+            msg = (f"No syllabus content is published for "
+                   f"**{_course_name(c)}** (ID {params.course_id}).")
+            try:
+                matches = await _paginated_get(
+                    f"/courses/{params.course_id}/files",
+                    {"search_term": "syllabus"}, max_items=10)
+            except Exception:  # noqa: BLE001
+                matches = []
+            matches = [m for m in matches if isinstance(m, dict)]
+            if matches:
+                return (msg + f"\n\nHowever, {len(matches)} file(s) matching "
+                        f"'syllabus' were found in Course Files — try "
+                        f"canvas_get_file on one of these:\n"
+                        + "\n".join(
+                            f"- **{f.get('display_name') or f.get('filename')}** "
+                            f"(file ID {f.get('id')})" for f in matches))
+            return (msg + " Check canvas_get_home_page or canvas_list_files for "
+                    "this course, or look for the syllabus mentioned in "
+                    "canvas_list_announcements.")
         return f"# Syllabus — {_course_name(c)}\n\n{body}"
     except Exception as e:  # noqa: BLE001
         return _handle_api_error(e)
@@ -859,6 +1258,34 @@ async def _fetch_text(url: str, limit: int = HTML_TEXT_LIMIT) -> Optional[str]:
         return text
 
 
+def _extract_pdf_text(content: bytes, limit: int = HTML_TEXT_LIMIT,
+                      max_pages: int = 40) -> str:
+    """Best-effort text extraction from PDF bytes. Returns '' if the PDF parses
+    successfully but has no extractable text layer (e.g. a scanned image PDF).
+    Raises on a genuinely unparseable/corrupt PDF or a missing pypdf install —
+    callers should catch that separately from an empty-string ("no text layer")
+    result so the user gets an accurate explanation.
+    """
+    import io
+    from pypdf import PdfReader
+    reader = PdfReader(io.BytesIO(content))
+    pages_text = []
+    for i, page in enumerate(reader.pages):
+        if i >= max_pages:
+            pages_text.append(
+                f"\n…[{len(reader.pages) - max_pages} more page(s) not extracted]")
+            break
+        try:
+            pages_text.append(page.extract_text() or "")
+        except Exception:  # noqa: BLE001
+            continue
+    text = "\n\n".join(t for t in pages_text if t.strip())
+    text = text.strip()
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "\n…[truncated]"
+    return text
+
+
 def _dry_run(action: str, *, target: str = "", payload: str = "") -> str:
     """Standard preview returned by a write tool when confirm is False."""
     lines = ["⚠️ DRY RUN — nothing was sent to Canvas.", "",
@@ -881,17 +1308,42 @@ def _excerpt(text: Optional[str], n: int = 300) -> str:
 
 def _render_entries(entries: Optional[list[dict[str, Any]]],
                     participants: dict[Any, str], depth: int = 0) -> list[str]:
-    """Recursively render a Canvas discussion 'view' entry tree to markdown."""
+    """Recursively render a Canvas discussion 'view' entry tree to markdown.
+
+    Recurses into a deleted entry's replies even though the deleted entry
+    itself is not rendered — a live reply nested under a deleted parent
+    must not become invisible.
+    """
     out: list[str] = []
     for e in entries or []:
-        if not isinstance(e, dict) or e.get("deleted"):
+        if not isinstance(e, dict):
             continue
-        author = participants.get(e.get("user_id"), "Unknown")
-        when = _fmt_dt(e.get("created_at"))
-        msg = _strip_html(e.get("message"), limit=1500) or "(no text)"
-        indent = "    " * depth
-        out.append(f"{indent}- **{author}** · {when}\n{indent}  {msg}")
+        if not e.get("deleted"):
+            author = participants.get(e.get("user_id"), "Unknown")
+            when = _fmt_dt(e.get("created_at"))
+            msg = _strip_html(e.get("message"), limit=1500) or "(no text)"
+            indent = "    " * depth
+            out.append(f"{indent}- **{author}** · {when}\n{indent}  {msg}")
         out.extend(_render_entries(e.get("replies"), participants, depth + 1))
+    return out
+
+
+def _collect_own_entries(entries: Optional[list[dict[str, Any]]], self_id: Any,
+                         out: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
+    """Recursively collect every entry (at any depth) authored by self_id.
+
+    Recurses into a deleted entry's replies even though the deleted entry
+    itself is not collected — a live reply nested under a deleted parent
+    must not become invisible.
+    """
+    if out is None:
+        out = []
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        if not e.get("deleted") and e.get("user_id") == self_id:
+            out.append(e)
+        _collect_own_entries(e.get("replies"), self_id, out)
     return out
 
 
@@ -930,7 +1382,9 @@ class GetFileInput(_Base):
     include_content: bool = Field(
         default=True,
         description="For text-based files (txt, md, csv, html, json), download and "
-                    "inline the file's text. Binary files (pdf, docx, images) always "
+                    "inline the file's text. PDFs are downloaded and their text "
+                    "layer extracted (best effort — layout and images are lost, "
+                    "large files are skipped). Other binary files (docx, images) "
                     "return metadata and a download URL only.")
 
 
@@ -947,6 +1401,12 @@ class GetDiscussionInput(_Base):
                           ge=1)
     include_replies: bool = Field(
         default=True, description="Include the full threaded reply tree.")
+    only_mine: bool = Field(
+        default=False,
+        description="If True, skip the full reply tree and instead show only "
+                    "entries authored by you — useful for checking whether "
+                    "you've already posted to this discussion. Implies "
+                    "include_replies (it still needs the full thread to search).")
 
 
 class ListQuizzesInput(_Base):
@@ -1263,14 +1723,17 @@ async def canvas_list_files(params: ListFilesInput) -> str:
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 )
 async def canvas_get_file(params: GetFileInput) -> str:
-    """Get a file's metadata and, for text-based files, its content.
+    """Get a file's metadata and, for text-based files and PDFs, its content.
 
-    Binary files (pdf, docx, images) return metadata plus a download URL the user
-    can open. Text files (txt, md, csv, html, json) are downloaded and inlined.
+    Text files (txt, md, csv, html, json) are downloaded and inlined. PDFs are
+    downloaded and their text layer extracted (best effort: layout, tables, and
+    images are lost; only the first 40 pages are read; files over 15 MB and
+    scanned/image-only PDFs are not extracted). Other binary files (docx,
+    images) return metadata plus a download URL the user can open.
 
     Args:
         params.file_id: Canvas file ID.
-        params.include_content: Inline text content for text-based files.
+        params.include_content: Inline text content for text-based files and PDFs.
 
     Returns:
         str: File metadata, plus inlined text content when applicable.
@@ -1288,7 +1751,45 @@ async def canvas_get_file(params: GetFileInput) -> str:
                f"- Size: {size_str}",
                f"- Updated: {_fmt_dt(f.get('updated_at'))}",
                f"- Download: {url or '—'}"]
-        if params.include_content and url:
+        is_pdf = "pdf" in str(ctype).lower() or name.lower().endswith(".pdf")
+        if params.include_content and url and is_pdf:
+            if isinstance(size, int) and size > 15 * 1024 * 1024:
+                out.append(f"\n_(PDF is {size / (1024 * 1024):.1f} MB — too large "
+                           f"to extract automatically. Use the download URL above.)_")
+            else:
+                try:
+                    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT,
+                                                 follow_redirects=True) as client:
+                        resp = await client.get(url)
+                        resp.raise_for_status()
+                        content = resp.content
+                except Exception:  # noqa: BLE001
+                    content = b""
+                extraction_failed = False
+                text = ""
+                if content:
+                    try:
+                        text = _extract_pdf_text(content, limit=8000)
+                    except Exception:  # noqa: BLE001
+                        extraction_failed = True
+                if text:
+                    out.append("\n## Content (extracted from PDF)\n" + text)
+                    out.append("\n_(Text extracted from PDF — layout, tables, and "
+                               "images are lost. If this looks garbled or "
+                               "incomplete, use the download URL above.)_")
+                elif not content:
+                    out.append("\n_(Could not download the PDF to extract its text. "
+                               "Use the download URL above to open it.)_")
+                elif extraction_failed:
+                    out.append("\n_(This PDF could not be parsed — it may be "
+                               "corrupted, encrypted, or password-protected. Use "
+                               "the download URL above to open it.)_")
+                else:
+                    out.append("\n_(PDF text extraction was attempted but found no "
+                               "extractable text — this is likely a scanned or "
+                               "image-only PDF. Use the download URL above to open "
+                               "it.)_")
+        elif params.include_content and url:
             try:
                 text = await _fetch_text(url, limit=8000)
             except Exception:  # noqa: BLE001
@@ -1361,6 +1862,8 @@ async def canvas_get_discussion(params: GetDiscussionInput) -> str:
         params.course_id: Canvas course ID.
         params.topic_id: Discussion topic ID.
         params.include_replies: Include the threaded reply tree.
+        params.only_mine: Show only your own entries instead of the full tree —
+            use this to check whether you have already posted.
 
     Returns:
         str: The topic prompt, then each reply with author, timestamp, and text.
@@ -1373,17 +1876,50 @@ async def canvas_get_discussion(params: GetDiscussionInput) -> str:
                f"{' · ' + t['html_url'] if t.get('html_url') else ''}_\n",
                "## Prompt", _strip_html(t.get("message"), limit=4000) or "(no prompt text)"]
 
-        if params.include_replies:
-            view = await _get(
-                f"/courses/{params.course_id}/discussion_topics/"
-                f"{params.topic_id}/view")
-            participants = {p.get("id"): p.get("display_name", "Unknown")
-                            for p in view.get("participants", [])
-                            if isinstance(p, dict)}
-            entries = view.get("view", [])
-            rendered = _render_entries(entries, participants)
-            out.append(f"\n## Replies ({len(rendered) and 'threaded' or 'none'})")
-            out.extend(rendered or ["(no replies yet)"])
+        if params.include_replies or params.only_mine:
+            try:
+                view = await _get(
+                    f"/courses/{params.course_id}/discussion_topics/"
+                    f"{params.topic_id}/view")
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 403:
+                    if params.only_mine:
+                        out.append(
+                            "\n## Your entries\n_Cannot determine whether you've "
+                            "posted: the replies endpoint returned 403 Forbidden "
+                            "from Canvas (this can happen even when the topic "
+                            "prompt itself is readable). Check the discussion in "
+                            "the Canvas web UI, or retry later._")
+                    else:
+                        out.append(
+                            "\n## Replies\n_Could not load replies (403 Forbidden "
+                            "from Canvas on the replies endpoint — this can happen "
+                            "even when the topic prompt itself is readable). Call "
+                            "this tool again with include_replies=false to skip "
+                            "retrying it, or retry later._")
+                    return "\n".join(out)
+                raise
+            if params.only_mine:
+                me = await _get("/users/self")
+                mine = _collect_own_entries(view.get("view", []), me.get("id"))
+                out.append(f"\n## Your entries ({len(mine)})")
+                if not mine:
+                    out.append("(no entries found — you have not posted to this "
+                               "discussion yet)")
+                else:
+                    for entry in mine:
+                        when = _fmt_dt(entry.get("created_at"))
+                        msg = _strip_html(entry.get("message"),
+                                          limit=1500) or "(no text)"
+                        out.append(f"- **{when}**\n  {msg}")
+            else:
+                participants = {p.get("id"): p.get("display_name", "Unknown")
+                                for p in view.get("participants", [])
+                                if isinstance(p, dict)}
+                entries = view.get("view", [])
+                rendered = _render_entries(entries, participants)
+                out.append(f"\n## Replies ({len(rendered) and 'threaded' or 'none'})")
+                out.extend(rendered or ["(no replies yet)"])
         return "\n".join(out)
     except Exception as e:  # noqa: BLE001
         return _handle_api_error(e)
@@ -1565,7 +2101,9 @@ async def canvas_list_todo(params: TodoInput) -> str:
     """List Canvas's own to-do items for the user (things needing action).
 
     This is Canvas's native to-do list — typically upcoming assignments/quizzes
-    that have not yet been submitted, across all courses.
+    that have not yet been submitted, across all courses. Still-actionable graded
+    discussion topics are also swept in, because Canvas's own to-do endpoint does
+    not reliably surface them.
 
     Args:
         params.response_format: 'markdown' or 'json'.
@@ -1581,6 +2119,7 @@ async def canvas_list_todo(params: TodoInput) -> str:
                 continue
             obj = it.get("assignment") or it.get("quiz") or {}
             rows.append({
+                "id": obj.get("id"),
                 "type": it.get("type"),
                 "title": obj.get("name") or obj.get("title") or "(untitled)",
                 "course": it.get("context_name"),
@@ -1588,13 +2127,54 @@ async def canvas_list_todo(params: TodoInput) -> str:
                 "points": obj.get("points_possible"),
                 "url": it.get("html_url") or obj.get("html_url"),
             })
+
+        # Canvas's to-do endpoint omits graded discussions — add the actionable ones.
+        # Prefer matching on the Canvas assignment ID (stable); fall back to
+        # course-name + title only when either side has no ID.
+        def _already_listed(d: dict[str, Any]) -> bool:
+            d_id = d.get("id")
+            for r in rows:
+                r_id = r.get("id")
+                if d_id is not None and r_id is not None:
+                    if d_id == r_id:
+                        return True
+                elif (r["course"], r["title"]) == (d["context"], d["title"]):
+                    return True
+            return False
+
+        discussions, disc_skipped = await _fetch_graded_discussions()
+        for d in discussions:
+            if d["status"] not in ("missing", "not submitted"):
+                continue
+            if _already_listed(d):
+                continue
+            rows.append({
+                "id": d.get("id"),
+                "type": d["type"],
+                "title": d["title"],
+                "course": d["context"],
+                "due_at": d["due"],
+                "points": d["points"],
+                "url": d["html_url"],
+            })
         rows.sort(key=lambda r: r["due_at"] or "9999")
 
         if params.response_format == ResponseFormat.JSON:
-            return json.dumps({"count": len(rows), "todo": rows}, indent=2)
+            return json.dumps({"count": len(rows), "todo": rows,
+                               "skipped_courses": disc_skipped}, indent=2)
+        note = ""
+        if disc_skipped:
+            note = (f"_(Note: could not check {', '.join(disc_skipped)} — you may "
+                    f"be missing items from "
+                    f"{'this course' if len(disc_skipped) == 1 else 'these courses'}"
+                    f".)_")
         if not rows:
-            return "Your Canvas to-do list is empty."
-        lines = [f"**{len(rows)} Canvas to-do item(s):**\n"]
+            empty = "Your Canvas to-do list is empty."
+            return f"{note}\n\n{empty}" if note else empty
+        lines = []
+        if note:
+            lines.append(note + "\n")
+        lines.append(f"**{len(rows)} Canvas to-do item(s):**\n")
         for r in rows:
             pts = f", {r['points']} pts" if r["points"] is not None else ""
             ctx = f" · {r['course']}" if r["course"] else ""
@@ -2457,6 +3037,84 @@ async def canvas_list_outcomes(params: ListOutcomesInput) -> str:
         return "\n".join(lines).rstrip()
     except Exception as e:  # noqa: BLE001
         return _handle_api_error(e)
+
+
+class ListToolsInput(_Base):
+    pass
+
+
+@mcp.tool(
+    name="canvas_list_tools",
+    annotations={"title": "List Available Canvas Tools", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+async def canvas_list_tools(params: ListToolsInput) -> str:
+    """List every tool this Canvas MCP server provides, grouped by category, with
+    a one-line purpose for each. Call this FIRST when exploring what this
+    connector can do — courses, assignments, grades, announcements, modules,
+    pages, files, discussions, quizzes, calendar, to-do, people, and the
+    confirm-gated write tools all live here, so one call surfaces the whole
+    toolset instead of discovering them one search at a time.
+
+    Returns:
+        str: Every tool name and a one-line description, grouped by category.
+    """
+    groups = [
+        ("Profile & courses", [
+            ("canvas_get_profile", "Verify the token and see whose account is connected."),
+            ("canvas_list_courses", "List your courses, with term and current grade."),
+        ]),
+        ("Assignments & grades", [
+            ("canvas_list_assignments", "List a course's assignments with due dates and submission status."),
+            ("canvas_get_assignment", "Full detail on one assignment: description, rubric, your submission."),
+            ("canvas_get_submission", "Your submission body, score, rubric feedback, grader comments."),
+            ("canvas_get_grades", "Current grade summary across courses, or per-assignment scores for one."),
+            ("canvas_list_upcoming", "Everything due soon across all courses, plus an always-on overdue sweep."),
+            ("canvas_list_todo", "Canvas's own to-do list of unsubmitted work."),
+        ]),
+        ("Announcements & communication", [
+            ("canvas_list_announcements", "Recent announcements, one course or all active courses."),
+            ("canvas_send_message", "Send a Canvas Inbox message (write — confirm-gated)."),
+        ]),
+        ("Course content", [
+            ("canvas_list_modules", "A course's module structure, optionally with items."),
+            ("canvas_get_syllabus", "A course's syllabus body."),
+            ("canvas_list_pages", "Wiki pages in a course."),
+            ("canvas_get_page", "Read one wiki page's full body."),
+            ("canvas_get_home_page", "A course's front/home page body."),
+            ("canvas_list_files", "Files uploaded to a course."),
+            ("canvas_get_file", "A file's metadata; text and PDF content is extracted when possible."),
+        ]),
+        ("Discussions & quizzes", [
+            ("canvas_list_discussions", "Discussion topics in a course."),
+            ("canvas_get_discussion", "Read a topic's prompt and replies (or just your own entries)."),
+            ("canvas_list_quizzes", "Quizzes in a course with due dates and points."),
+            ("canvas_get_quiz", "One quiz's settings and instructions."),
+        ]),
+        ("Calendar & course meta", [
+            ("canvas_list_calendar_events", "Calendar events or assignment due-dates in a date range."),
+            ("canvas_list_tabs", "Which tabs/features are enabled for a course."),
+            ("canvas_list_people", "Course members — students, teachers, TAs."),
+            ("canvas_list_conferences", "Video conference sessions for a course."),
+            ("canvas_list_collaborations", "Shared collaborative documents in a course."),
+            ("canvas_list_outcomes", "Learning outcomes for a course."),
+        ]),
+        ("Write tools (all confirm-gated — first call previews, second with confirm=true acts)", [
+            ("canvas_create_planner_note", "Create a personal planner note/to-do."),
+            ("canvas_submit_assignment", "Submit text/URL/file to an assignment."),
+            ("canvas_post_discussion_entry", "Post a new top-level discussion entry."),
+            ("canvas_reply_to_entry", "Reply to a specific discussion entry."),
+            ("canvas_post_submission_comment", "Comment on your own submission."),
+            ("canvas_upload_file", "Upload a local file to Canvas course files."),
+        ]),
+    ]
+    lines = ["# Canvas MCP — available tools\n"]
+    for title, tools in groups:
+        lines.append(f"## {title}")
+        for name, desc in tools:
+            lines.append(f"- **{name}** — {desc}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 # --------------------------------------------------------------------------- #
