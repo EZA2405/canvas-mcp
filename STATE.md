@@ -1,5 +1,69 @@
 # STATE
 
+## 2026-09-16 — Claude Desktop/Cowork proxy compatibility
+
+### Changed
+
+- The server loads `.env` from the directory containing `canvas_mcp.py` before
+  deriving any configuration constants. Existing process environment values
+  take precedence, so Codex/Claude per-server env blocks still override `.env`.
+- All Canvas HTTP clients are created through `_canvas_client()`, which defaults
+  `trust_env` off via `CANVAS_TRUST_ENV=0`. This prevents Claude's inherited
+  `HTTP_PROXY`/`HTTPS_PROXY` values from silently routing Canvas traffic through
+  an allow-list proxy. Set `CANVAS_TRUST_ENV=1` only when that proxy is intended.
+- API clients send `Accept: application/json` and a stable User-Agent. Signed
+  download and presigned upload clients override Accept with `*/*`; the two
+  upload clients retain `follow_redirects=False`, so their explicit Canvas
+  three-step upload confirmation flow is unchanged.
+- Unexpected HTTP errors include up to 300 characters of response text. HTTP
+  406 identifies an egress proxy as the likely source, and proxy-enabled
+  connection failures now give the same actionable bypass guidance.
+- `.env` and timestamped backup files are ignored by Git. The live `.env` is
+  mode 0600 and is intentionally not committed.
+
+### Verified live over MCP stdio
+
+- `canvas_list_courses`, `canvas_get_profile`, `canvas_list_todo`, and
+  `canvas_list_announcements` all returned real Canvas data.
+- With bogus `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` values and
+  `CANVAS_TRUST_ENV` unset, `canvas_get_profile` still reached Canvas and
+  returned HTTP 200 (the `.env` default is used). With `CANVAS_TRUST_ENV=1`, the
+  same MCP call failed loudly with the proxy-specific connection message.
+- Claude Desktop's `canvas` entry launches this repository's venv and script.
+  Its token and base URL exactly match `.env`; those two Claude-provided values
+  are live because environment variables win. `.env` supplies timezone and
+  `CANVAS_TRUST_ENV=0` because Claude does not set them.
+- The exact Codex and Claude Desktop command/argument/env configurations were
+  each used to launch the shared server over stdio. Both returned a real Canvas
+  profile; the Claude launch also succeeded with bogus inherited HTTP, HTTPS,
+  and ALL proxy variables while `CANVAS_TRUST_ENV` was left unset.
+- `canvas_mcp.py` compiles cleanly under the project venv.
+
+### Still unverified / external issue
+
+- `canvas_get_file` returned real PDF metadata, and redirects correctly reached
+  Canvas user-content storage and then `inst-fs-sin-prod.inscloudgate.net`.
+  Eight real PDFs were attempted, but that final nginx endpoint returned HTTP
+  406 every time, including independent probes using default httpx, wildcard,
+  browser-like, and curl-like headers. PDF bytes/text extraction therefore
+  could not be verified. This 406 was reproduced outside Claude's launch
+  environment with proxy inheritance disabled, so it is separate from the
+  Claude egress-proxy failure.
+- Uploads were reviewed but not performed because that would write user data to
+  Canvas. Both upload paths still disable automatic redirects for the presigned
+  POST and explicitly follow 301/302/303 to Canvas's authenticated confirmation
+  endpoint.
+
+### Configuration recommendation
+
+- Remove `CANVAS_API_TOKEN` from `~/.codex/config.toml` after restarting and
+  smoke-testing Codex with this checkout. This reduces duplicate plaintext
+  secret copies; `.env` then becomes the single local secret source. If `.env`
+  is deleted or unreadable and no client supplies the token, every authenticated
+  tool returns the explicit `CANVAS_API_TOKEN is not set` error. Claude currently
+  remains operational in that scenario because its own env block still contains
+  the matching token; Codex would not after its duplicate is removed.
+
 ## Done
 All 11 issues reported about the Canvas MCP server are fixed in the working tree
 (not committed yet — waiting on your go-ahead). Verified by running the actual
@@ -86,14 +150,12 @@ session) and by `python3 -m py_compile canvas_mcp.py` (clean).
   time — still much faster than before, without the burst risk.
 
 ## Next
-1. You review and approve the diff (`git diff` in
-   `/Users/eduardozablan/Desktop/repos.nosync/canvas_mcp/canvas_mcp.py`), then
-   I commit it.
+1. Committed as `b19ca93` on `main`.
 2. Restart/reload the MCP server in whatever client has it configured (Claude
    Desktop, etc.) so it picks up the new code.
 3. Run the affected tools against your real Canvas account once and spot-check
    the numbers against the Canvas web UI — everything above was verified with
-   simulated API responses, not live data.
+   simulated API responses across three rounds of code review, not live data.
 
 ## Broken
 Nothing known to be broken. The one thing fixed along the way but not part of

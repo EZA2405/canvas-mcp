@@ -40,6 +40,35 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, ConfigDict, Field
 
+
+def _load_dotenv() -> None:
+    """Load KEY=VALUE pairs from a .env next to this file.
+
+    Lets the server find its own configuration regardless of which MCP client
+    launched it (Codex, Claude Desktop, Claude Cowork, plain CLI), instead of
+    depending on each client's per-server env block. Existing environment
+    variables always win, so a client-provided value still overrides the file.
+    """
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.is_file():
+        return
+    try:
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = val
+    except OSError:
+        pass
+
+
+# Load file-backed configuration before deriving any module-level settings.
+_load_dotenv()
+
 # --------------------------------------------------------------------------- #
 # Configuration & constants
 # --------------------------------------------------------------------------- #
@@ -78,6 +107,35 @@ class ResponseFormat(str, Enum):
 class CanvasError(Exception):
     """Raised when the Canvas API returns an error or is misconfigured."""
 
+# Some hosts (notably Claude Desktop/Cowork) launch local MCP servers with
+# HTTP_PROXY/HTTPS_PROXY pointing at an allow-listing egress proxy. Canvas is
+# not on that allow-list, so every request comes back as an opaque HTTP 406 that
+# looks like a Canvas error but never touched Canvas. httpx picks those proxy
+# variables up automatically via trust_env, so we default to ignoring them and
+# talking to Canvas directly. Set CANVAS_TRUST_ENV=1 if you genuinely need the
+# proxy (e.g. a corporate network where direct egress is blocked).
+CANVAS_TRUST_ENV = os.environ.get("CANVAS_TRUST_ENV", "0").lower() in {"1", "true", "yes"}
+
+USER_AGENT = os.environ.get("CANVAS_USER_AGENT", "canvas-mcp/1.0 (+httpx)")
+
+DEFAULT_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": USER_AGENT,
+}
+
+
+def _canvas_client(**kwargs: Any) -> httpx.AsyncClient:
+    """httpx.AsyncClient preconfigured for Canvas.
+
+    Centralises proxy handling and default headers so every call site behaves
+    the same way.
+    """
+    kwargs.setdefault("trust_env", CANVAS_TRUST_ENV)
+    headers = dict(DEFAULT_HEADERS)
+    headers.update(kwargs.pop("headers", None) or {})
+    kwargs["headers"] = headers
+    return httpx.AsyncClient(**kwargs)
+
 
 def _headers() -> dict[str, str]:
     if not CANVAS_API_TOKEN:
@@ -106,10 +164,28 @@ def _handle_api_error(e: Exception) -> str:
                     "correct and that you are enrolled in that course.")
         if code == 429:
             return "Error: Rate limit exceeded (429). Wait a moment and retry."
-        return f"Error: Canvas API request failed with HTTP {code}."
+        detail = ""
+        try:
+            body = (e.response.text or "").strip()
+            if body:
+                detail = f" Response: {body[:300]}"
+        except Exception:
+            pass
+        if code == 406:
+            return ("Error: Canvas API request failed with HTTP 406. This is "
+                    "almost always an egress proxy rejecting the request rather "
+                    "than Canvas itself — check HTTP_PROXY/HTTPS_PROXY in the "
+                    "environment this server was launched in, or set "
+                    f"CANVAS_TRUST_ENV=0 to bypass it.{detail}")
+        return f"Error: Canvas API request failed with HTTP {code}.{detail}"
     if isinstance(e, httpx.TimeoutException):
         return "Error: Request to Canvas timed out. Check your connection and retry."
     if isinstance(e, httpx.ConnectError):
+        if CANVAS_TRUST_ENV:
+            return (f"Error: Could not connect to {CANVAS_BASE_URL} while proxy "
+                    "environment variables are enabled. The configured "
+                    "HTTP_PROXY/HTTPS_PROXY may be unreachable or may reject "
+                    "Canvas; set CANVAS_TRUST_ENV=0 to bypass it.")
         return (f"Error: Could not connect to {CANVAS_BASE_URL}. Verify CANVAS_BASE_URL "
                 "is your institution's Canvas address.")
     return f"Error: Unexpected {type(e).__name__}: {e}"
@@ -118,7 +194,7 @@ def _handle_api_error(e: Exception) -> str:
 async def _get(path: str, params: Optional[dict[str, Any]] = None) -> Any:
     """Single GET request returning parsed JSON. `path` is relative to API_BASE."""
     url = path if path.startswith("http") else f"{API_BASE}{path}"
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with _canvas_client(timeout=REQUEST_TIMEOUT) as client:
         resp = await client.get(url, headers=_headers(), params=params)
         resp.raise_for_status()
         return resp.json()
@@ -132,7 +208,7 @@ async def _paginated_get(path: str, params: Optional[dict[str, Any]] = None,
     url: Optional[str] = f"{API_BASE}{path}"
     out: list[Any] = []
     pages = 0
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with _canvas_client(timeout=REQUEST_TIMEOUT) as client:
         while url and pages < MAX_PAGES and len(out) < max_items:
             resp = await client.get(url, headers=_headers(),
                                     params=params if pages == 0 else None)
@@ -1226,7 +1302,7 @@ async def _send(method: str, path: str,
     directly in ``data``; list values are encoded as repeated keys by httpx.
     """
     url = path if path.startswith("http") else f"{API_BASE}{path}"
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with _canvas_client(timeout=REQUEST_TIMEOUT) as client:
         resp = await client.request(method, url, headers=_headers(), data=data)
         resp.raise_for_status()
         if resp.text.strip():
@@ -1244,8 +1320,9 @@ async def _fetch_text(url: str, limit: int = HTML_TEXT_LIMIT) -> Optional[str]:
     No auth header is sent: Canvas file URLs are pre-signed and live on a
     different host.
     """
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT,
-                                 follow_redirects=True) as client:
+    async with _canvas_client(timeout=REQUEST_TIMEOUT,
+                              follow_redirects=True,
+                              headers={"Accept": "*/*"}) as client:
         resp = await client.get(url)
         resp.raise_for_status()
         ctype = resp.headers.get("content-type", "").lower()
@@ -1758,8 +1835,9 @@ async def canvas_get_file(params: GetFileInput) -> str:
                            f"to extract automatically. Use the download URL above.)_")
             else:
                 try:
-                    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT,
-                                                 follow_redirects=True) as client:
+                    async with _canvas_client(timeout=REQUEST_TIMEOUT,
+                                              follow_redirects=True,
+                                              headers={"Accept": "*/*"}) as client:
                         resp = await client.get(url)
                         resp.raise_for_status()
                         content = resp.content
@@ -2425,7 +2503,7 @@ async def _canvas_upload_file(course_id: int, local_path: str,
     if folder_path:
         slot_data["parent_folder_path"] = folder_path
 
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with _canvas_client(timeout=REQUEST_TIMEOUT) as client:
         r1 = await client.post(f"{API_BASE}/courses/{course_id}/files",
                                headers=_headers(), data=slot_data)
         r1.raise_for_status()
@@ -2440,13 +2518,14 @@ async def _canvas_upload_file(course_id: int, local_path: str,
     file_bytes = p.read_bytes()
     files = {file_param: (name, file_bytes, mime)}
 
-    async with httpx.AsyncClient(timeout=120.0, follow_redirects=False) as client:
+    async with _canvas_client(timeout=120.0, follow_redirects=False,
+                              headers={"Accept": "*/*"}) as client:
         r2 = await client.post(upload_url, data=upload_params, files=files)
 
         if r2.status_code in (301, 302, 303):
             # Step 3: S3 path — follow redirect to Canvas confirm URL (needs auth).
             confirm_url = r2.headers["location"]
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c3:
+            async with _canvas_client(timeout=REQUEST_TIMEOUT) as c3:
                 r3 = await c3.get(confirm_url, headers=_headers())
                 r3.raise_for_status()
                 return r3.json()
@@ -2479,7 +2558,7 @@ async def _upload_user_file(local_path: str,
         "name": name, "size": size, "content_type": mime,
         "parent_folder_path": "conversation attachments",
     }
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with _canvas_client(timeout=REQUEST_TIMEOUT) as client:
         r1 = await client.post(f"{API_BASE}/users/self/files",
                                headers=_headers(), data=slot_data)
         r1.raise_for_status()
@@ -2493,12 +2572,13 @@ async def _upload_user_file(local_path: str,
     # Step 2: POST file to the pre-signed URL (no auth header).
     file_bytes = p.read_bytes()
     files = {file_param: (name, file_bytes, mime)}
-    async with httpx.AsyncClient(timeout=120.0, follow_redirects=False) as client:
+    async with _canvas_client(timeout=120.0, follow_redirects=False,
+                              headers={"Accept": "*/*"}) as client:
         r2 = await client.post(upload_url, data=upload_params, files=files)
         if r2.status_code in (301, 302, 303):
             # Step 3: S3 path — follow redirect to Canvas confirm URL (needs auth).
             confirm_url = r2.headers["location"]
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c3:
+            async with _canvas_client(timeout=REQUEST_TIMEOUT) as c3:
                 r3 = await c3.get(confirm_url, headers=_headers())
                 r3.raise_for_status()
                 return r3.json()
