@@ -54,6 +54,36 @@ was deliberately left out.
 | `canvas_list_calendar_events` | Calendar events or assignment due-dates in a date range |
 | `canvas_list_todo` | Canvas's native to-do list |
 
+## Code Mode (`canvas_run_code`)
+
+Based on Cloudflare's [Code Mode](https://blog.cloudflare.com/code-mode/). For
+questions that need many Canvas calls ("which unsubmitted assignments worth 20+
+points are due in the next two weeks, across all courses?"), Claude writes one
+short JavaScript snippet instead of chaining a dozen tool calls. The snippet
+runs on your machine, calls Canvas, filters the data, and returns only the
+answer — faster, and it keeps large raw data out of Claude's context.
+
+- Runs in [Deno](https://deno.com) with **no permissions**: no internet, no
+  files, no environment variables, no other programs. Install once with
+  `brew install deno` (or set `DENO_PATH`).
+- Its only access is a `canvas` object that this server answers. Requests are
+  **GET-only** and limited to the Canvas API, and your token never enters the
+  sandbox.
+- `canvas_run_code` is read-only. `canvas_run_code_write` uses the same sandbox
+  but may also call the write tools below from the script (for example, find
+  every unanswered graded discussion, then post). It is marked destructive, so
+  Claude asks your approval before each run. Each write still previews unless
+  the script passes `confirm: true`. Nothing can delete.
+- Limits per script: 120 seconds, 300 Canvas calls, 30,000 characters of output.
+
+## Course names instead of IDs
+
+Every `course_id` (and `course_ids` / `exclude_course_ids`) accepts a numeric
+ID **or** a course code or name: `"THEO 13"`, `"theo13"`, `"FAA 111.20"`,
+`"philosophy of religion"`. Active courses are searched first, then completed
+ones. If a name fits more than one course (e.g. `"PE"`), the tool lists the
+matches instead of guessing.
+
 ## Write tools (confirm-gated)
 
 | Tool | Purpose | Stakes |

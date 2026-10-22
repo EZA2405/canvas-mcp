@@ -29,10 +29,11 @@ import os
 import re
 import argparse
 import asyncio
+import functools
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Annotated, Any, Optional, Union
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -429,6 +430,90 @@ async def _fetch_graded_discussions(
 
 
 # --------------------------------------------------------------------------- #
+# Course references — every course_id accepts an ID or a code/name ("THEO 13")
+# --------------------------------------------------------------------------- #
+
+CourseRef = Union[
+    Annotated[int, Field(ge=1)],
+    Annotated[str, Field(min_length=1,
+                         description="Course code or name, e.g. \"THEO 13\".")],
+]
+COURSE_DESC = "Canvas course ID, or a course code/name such as \"THEO 13\"."
+COURSE_CACHE_TTL = 600.0  # seconds; course lists rarely change mid-session
+_course_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+
+def _tokens(text: str) -> list[str]:
+    """'THEO 13-L1' -> ['theo', '13', 'l', '1']; letters and digits split apart."""
+    return re.findall(r"[a-z]+|\d+", text.lower())
+
+
+def _match_courses(ref: str, courses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Exact code/name matches if any, else courses containing every query token
+    (digits must match whole, so "13" never matches "131"; words match as prefixes)."""
+    q = _tokens(ref)
+    if not q:
+        return []
+
+    def fields(c: dict[str, Any]) -> list[list[str]]:
+        code = c.get("course_code") or ""
+        return [_tokens(code.split("-")[0]), _tokens(code), _tokens(c.get("name") or "")]
+
+    exact = [c for c in courses if q in fields(c)]
+    if exact:
+        return exact
+    return [c for c in courses
+            if all(any(t == w if w.isdigit() else t.startswith(w)
+                       for t in sum(fields(c)[1:], [])) for w in q)]
+
+
+async def _resolve_course(ref: Any) -> int:
+    if isinstance(ref, int):
+        return ref
+    ref = str(ref).strip()
+    if ref.isdigit():
+        return int(ref)
+    for state in ("active", "completed"):
+        hit = _course_cache.get(state)
+        if not hit or asyncio.get_running_loop().time() - hit[0] > COURSE_CACHE_TTL:
+            hit = (asyncio.get_running_loop().time(), await _fetch_courses(state))
+            _course_cache[state] = hit
+        matches = _match_courses(ref, hit[1])
+        if len(matches) == 1:
+            return int(matches[0]["id"])
+        if matches:
+            names = "; ".join(f"{c.get('course_code')} — {_course_name(c)} (ID {c['id']})"
+                              for c in matches[:8])
+            raise CanvasError(f"{ref!r} matches {len(matches)} courses: {names}. "
+                              "Use the ID or a more specific code/name.")
+    raise CanvasError(f"No course matches {ref!r}. Use canvas_list_courses to see "
+                      "course codes, names, and IDs.")
+
+
+async def _resolve_course_fields(params: BaseModel) -> None:
+    for field in ("course_id", "course_ids", "exclude_course_ids"):
+        value = getattr(params, field, None)
+        if isinstance(value, list):
+            setattr(params, field, [await _resolve_course(v) for v in value])
+        elif value is not None:
+            setattr(params, field, await _resolve_course(value))
+
+
+def _tool(**kwargs: Any):
+    """mcp.tool, plus course-name resolution before the tool body runs."""
+    def register(fn):
+        @functools.wraps(fn)
+        async def wrapper(params):
+            try:
+                await _resolve_course_fields(params)
+            except Exception as e:  # noqa: BLE001
+                return _handle_api_error(e)
+            return await fn(params)
+        return mcp.tool(**kwargs)(wrapper)
+    return register
+
+
+# --------------------------------------------------------------------------- #
 # Input models
 # --------------------------------------------------------------------------- #
 
@@ -470,8 +555,7 @@ class ListCoursesInput(_Base):
 
 
 class ListAssignmentsInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID (from canvas_list_courses).",
-                           ge=1)
+    course_id: CourseRef = Field(..., description="Canvas course ID (from canvas_list_courses).")
     bucket: Optional[str] = Field(
         default=None,
         description="Optional filter: 'upcoming', 'past', 'overdue', 'unsubmitted', "
@@ -490,7 +574,7 @@ class ListAssignmentsInput(_Base):
 
 
 class GetAssignmentInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     assignment_id: int = Field(..., description="Canvas assignment ID.", ge=1)
 
 
@@ -507,30 +591,28 @@ class UpcomingInput(_Base):
 
 
 class GradesInput(_Base):
-    course_id: Optional[int] = Field(
+    course_id: Optional[CourseRef] = Field(
         default=None,
         description="Optional course ID. If omitted, returns current grade summary "
                     "across all active courses. If given, returns per-assignment scores.",
-        ge=1,
     )
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN,
                                             description="'markdown' or 'json'.")
 
 
 class AnnouncementsInput(_Base):
-    course_id: Optional[int] = Field(
+    course_id: Optional[CourseRef] = Field(
         default=None,
         description="Optional course ID. If omitted, pulls announcements from all "
                     "active courses.",
-        ge=1,
     )
-    course_ids: Optional[list[int]] = Field(
+    course_ids: Optional[list[CourseRef]] = Field(
         default=None,
         description="Optional list of specific course IDs to pull announcements "
                     "from. When given, this takes precedence over course_id and "
                     "over sweeping all active courses.",
     )
-    exclude_course_ids: Optional[list[int]] = Field(
+    exclude_course_ids: Optional[list[CourseRef]] = Field(
         default=None,
         description="Course IDs to exclude from the sweep — useful for "
                     "permanent hub/orientation sites that generate noisy "
@@ -551,7 +633,7 @@ class AnnouncementsInput(_Base):
 
 
 class ModulesInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     include_items: bool = Field(
         default=True,
         description="Include the items (pages, assignments, files) inside each module.",
@@ -561,7 +643,7 @@ class ModulesInput(_Base):
 
 
 class SyllabusInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
 
 
 # --------------------------------------------------------------------------- #
@@ -589,7 +671,7 @@ def _submission_summary(sub: Optional[dict[str, Any]]) -> str:
 # Tools
 # --------------------------------------------------------------------------- #
 
-@mcp.tool(
+@_tool(
     name="canvas_get_profile",
     annotations={"title": "Get Canvas Profile", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -613,7 +695,7 @@ async def canvas_get_profile(params: ProfileInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_list_courses",
     annotations={"title": "List Courses", "readOnlyHint": True, "destructiveHint": False,
                  "idempotentHint": True, "openWorldHint": True},
@@ -696,7 +778,7 @@ async def canvas_list_courses(params: ListCoursesInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_list_assignments",
     annotations={"title": "List Assignments", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -771,7 +853,7 @@ async def canvas_list_assignments(params: ListAssignmentsInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_get_assignment",
     annotations={"title": "Get Assignment Detail", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -844,7 +926,7 @@ async def canvas_get_assignment(params: GetAssignmentInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_list_upcoming",
     annotations={"title": "List Upcoming Due Items", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -1020,7 +1102,7 @@ async def _aggregate_course_score(course_id: int) -> Optional[tuple[float, float
     return (earned, possible, n)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_get_grades",
     annotations={"title": "Get Grades", "readOnlyHint": True, "destructiveHint": False,
                  "idempotentHint": True, "openWorldHint": True},
@@ -1108,7 +1190,7 @@ async def canvas_get_grades(params: GradesInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_list_announcements",
     annotations={"title": "List Announcements", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -1196,7 +1278,7 @@ async def canvas_list_announcements(params: AnnouncementsInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_list_modules",
     annotations={"title": "List Course Modules", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -1246,7 +1328,7 @@ async def canvas_list_modules(params: ModulesInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_get_syllabus",
     annotations={"title": "Get Course Syllabus", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -1429,7 +1511,7 @@ def _collect_own_entries(entries: Optional[list[dict[str, Any]]], self_id: Any,
 # --------------------------------------------------------------------------- #
 
 class ListPagesInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     search_term: Optional[str] = Field(
         default=None, description="Optional case-insensitive title filter.")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN,
@@ -1437,7 +1519,7 @@ class ListPagesInput(_Base):
 
 
 class GetPageInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     page: str = Field(
         ...,
         description="Page URL slug (e.g. 'course-syllabus') or numeric page ID. "
@@ -1446,7 +1528,7 @@ class GetPageInput(_Base):
 
 
 class ListFilesInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     search_term: Optional[str] = Field(
         default=None, description="Optional case-insensitive filename filter.")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN,
@@ -1466,13 +1548,13 @@ class GetFileInput(_Base):
 
 
 class ListDiscussionsInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN,
                                             description="'markdown' or 'json'.")
 
 
 class GetDiscussionInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     topic_id: int = Field(...,
                           description="Discussion topic ID (from canvas_list_discussions).",
                           ge=1)
@@ -1487,13 +1569,13 @@ class GetDiscussionInput(_Base):
 
 
 class ListQuizzesInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN,
                                             description="'markdown' or 'json'.")
 
 
 class GetQuizInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     quiz_id: int = Field(..., description="Quiz ID (from canvas_list_quizzes).", ge=1)
 
 
@@ -1506,8 +1588,8 @@ class CalendarInput(_Base):
         default="event", pattern=r"^(event|assignment)$",
         description="'event' for calendar events (class meetings, etc.) or "
                     "'assignment' for assignment due dates.")
-    course_id: Optional[int] = Field(
-        default=None, ge=1,
+    course_id: Optional[CourseRef] = Field(
+        default=None,
         description="Limit to one course. Omit for all active courses plus your "
                     "personal calendar.")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN,
@@ -1520,17 +1602,17 @@ class TodoInput(_Base):
 
 
 class ListTabsInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN,
                                             description="'markdown' or 'json'.")
 
 
 class GetHomePageInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
 
 
 class ListPeopleInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     enrollment_type: Optional[str] = Field(
         default=None,
         description="Filter by role: 'student', 'teacher', 'ta', 'observer', or "
@@ -1542,19 +1624,19 @@ class ListPeopleInput(_Base):
 
 
 class ListConferencesInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN,
                                             description="'markdown' or 'json'.")
 
 
 class ListCollaborationsInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN,
                                             description="'markdown' or 'json'.")
 
 
 class ListOutcomesInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN,
                                             description="'markdown' or 'json'.")
 
@@ -1576,13 +1658,13 @@ class CreatePlannerNoteInput(_Base):
         ..., description="When it should appear, ISO-8601 (YYYY-MM-DD or full "
                          "timestamp like 2026-06-27T09:00:00Z).")
     details: Optional[str] = Field(default=None, description="Optional longer description.")
-    course_id: Optional[int] = Field(
-        default=None, ge=1, description="Optional course to associate the note with.")
+    course_id: Optional[CourseRef] = Field(
+        default=None, description="Optional course to associate the note with.")
     confirm: bool = _CONFIRM
 
 
 class SubmitAssignmentInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     assignment_id: int = Field(..., description="Canvas assignment ID.", ge=1)
     submission_type: str = Field(
         ..., pattern=r"^(online_text_entry|online_url|online_upload)$",
@@ -1600,14 +1682,14 @@ class SubmitAssignmentInput(_Base):
 
 
 class PostDiscussionEntryInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     topic_id: int = Field(..., description="Discussion topic ID.", ge=1)
     message: str = Field(..., min_length=1, description="Body of the new top-level entry.")
     confirm: bool = _CONFIRM
 
 
 class ReplyToEntryInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     topic_id: int = Field(..., description="Discussion topic ID.", ge=1)
     entry_id: int = Field(..., description="ID of the entry being replied to.", ge=1)
     message: str = Field(..., min_length=1, description="Body of the reply.")
@@ -1615,7 +1697,7 @@ class ReplyToEntryInput(_Base):
 
 
 class PostSubmissionCommentInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     assignment_id: int = Field(..., description="Canvas assignment ID.", ge=1)
     comment: str = Field(..., min_length=1,
                          description="Comment text to attach to your submission.")
@@ -1623,7 +1705,7 @@ class PostSubmissionCommentInput(_Base):
 
 
 class UploadFileInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID to upload into.", ge=1)
+    course_id: CourseRef = Field(..., description="Canvas course ID to upload into.")
     local_path: str = Field(
         ..., min_length=1,
         description="Absolute path to the local file to upload.")
@@ -1638,7 +1720,7 @@ class UploadFileInput(_Base):
 
 
 class GetSubmissionInput(_Base):
-    course_id: int = Field(..., description="Canvas course ID.", ge=1)
+    course_id: CourseRef = Field(..., description=COURSE_DESC)
     assignment_id: int = Field(..., description="Canvas assignment ID.", ge=1)
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN,
                                             description="'markdown' or 'json'.")
@@ -1652,8 +1734,8 @@ class SendMessageInput(_Base):
                     "appear in announcement/discussion author data.")
     subject: str = Field(..., min_length=1, description="Message subject line.")
     body: str = Field(..., min_length=1, description="Message body text.")
-    course_id: Optional[int] = Field(
-        default=None, ge=1,
+    course_id: Optional[CourseRef] = Field(
+        default=None,
         description="Optional course ID. When given, sets the conversation context "
                     "so the message is associated with that course.")
     local_paths: Optional[list[str]] = Field(
@@ -1672,7 +1754,7 @@ class SendMessageInput(_Base):
 # Read tools — pages
 # --------------------------------------------------------------------------- #
 
-@mcp.tool(
+@_tool(
     name="canvas_list_pages",
     annotations={"title": "List Course Pages", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -1718,7 +1800,7 @@ async def canvas_list_pages(params: ListPagesInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_get_page",
     annotations={"title": "Get Page Content", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -1750,7 +1832,7 @@ async def canvas_get_page(params: GetPageInput) -> str:
 # Read tools — files
 # --------------------------------------------------------------------------- #
 
-@mcp.tool(
+@_tool(
     name="canvas_list_files",
     annotations={"title": "List Course Files", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -1794,7 +1876,7 @@ async def canvas_list_files(params: ListFilesInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_get_file",
     annotations={"title": "Get File", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -1886,7 +1968,7 @@ async def canvas_get_file(params: GetFileInput) -> str:
 # Read tools — discussions
 # --------------------------------------------------------------------------- #
 
-@mcp.tool(
+@_tool(
     name="canvas_list_discussions",
     annotations={"title": "List Discussions", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -1928,7 +2010,7 @@ async def canvas_list_discussions(params: ListDiscussionsInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_get_discussion",
     annotations={"title": "Get Discussion Thread", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -2007,7 +2089,7 @@ async def canvas_get_discussion(params: GetDiscussionInput) -> str:
 # Read tools — quizzes
 # --------------------------------------------------------------------------- #
 
-@mcp.tool(
+@_tool(
     name="canvas_list_quizzes",
     annotations={"title": "List Quizzes", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -2051,7 +2133,7 @@ async def canvas_list_quizzes(params: ListQuizzesInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_get_quiz",
     annotations={"title": "Get Quiz Detail", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -2093,7 +2175,7 @@ async def canvas_get_quiz(params: GetQuizInput) -> str:
 # Read tools — calendar & to-do
 # --------------------------------------------------------------------------- #
 
-@mcp.tool(
+@_tool(
     name="canvas_list_calendar_events",
     annotations={"title": "List Calendar Events", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -2170,7 +2252,7 @@ async def canvas_list_calendar_events(params: CalendarInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_list_todo",
     annotations={"title": "List To-Do", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -2267,7 +2349,7 @@ async def canvas_list_todo(params: TodoInput) -> str:
 # Write tools — each refuses to act unless confirm=True
 # --------------------------------------------------------------------------- #
 
-@mcp.tool(
+@_tool(
     name="canvas_create_planner_note",
     annotations={"title": "Create Planner Note", "readOnlyHint": False,
                  "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
@@ -2306,7 +2388,7 @@ async def canvas_create_planner_note(params: CreatePlannerNoteInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_submit_assignment",
     annotations={"title": "Submit Assignment", "readOnlyHint": False,
                  "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
@@ -2373,7 +2455,7 @@ async def canvas_submit_assignment(params: SubmitAssignmentInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_post_discussion_entry",
     annotations={"title": "Post Discussion Entry", "readOnlyHint": False,
                  "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
@@ -2411,7 +2493,7 @@ async def canvas_post_discussion_entry(params: PostDiscussionEntryInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_reply_to_entry",
     annotations={"title": "Reply To Discussion Entry", "readOnlyHint": False,
                  "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
@@ -2443,7 +2525,7 @@ async def canvas_reply_to_entry(params: ReplyToEntryInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_post_submission_comment",
     annotations={"title": "Comment On Submission", "readOnlyHint": False,
                  "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
@@ -2484,9 +2566,9 @@ async def canvas_post_submission_comment(params: PostSubmissionCommentInput) -> 
 # File upload helper (3-step Canvas upload protocol)
 # --------------------------------------------------------------------------- #
 
-async def _canvas_upload_file(course_id: int, local_path: str,
-                               display_name: Optional[str],
-                               folder_path: Optional[str]) -> dict[str, Any]:
+async def _upload_file(path: str, local_path: str,
+                       display_name: Optional[str],
+                       folder_path: Optional[str]) -> dict[str, Any]:
     """Execute Canvas's 3-step file upload and return the resulting file object."""
     p = Path(local_path)
     if not p.exists():
@@ -2504,7 +2586,7 @@ async def _canvas_upload_file(course_id: int, local_path: str,
         slot_data["parent_folder_path"] = folder_path
 
     async with _canvas_client(timeout=REQUEST_TIMEOUT) as client:
-        r1 = await client.post(f"{API_BASE}/courses/{course_id}/files",
+        r1 = await client.post(f"{API_BASE}{path}",
                                headers=_headers(), data=slot_data)
         r1.raise_for_status()
         slot = r1.json()
@@ -2534,63 +2616,27 @@ async def _canvas_upload_file(course_id: int, local_path: str,
         return r2.json()  # Canvas-native storage returns file object directly.
 
 
+async def _canvas_upload_file(course_id: int, local_path: str,
+                               display_name: Optional[str],
+                               folder_path: Optional[str]) -> dict[str, Any]:
+    """Upload a file to Canvas course files."""
+    return await _upload_file(f"/courses/{course_id}/files", local_path,
+                              display_name, folder_path)
+
+
 async def _upload_user_file(local_path: str,
                              display_name: Optional[str]) -> dict[str, Any]:
-    """Upload a file to the authenticated user's personal Canvas files.
-
-    Same 3-step Canvas upload protocol as _canvas_upload_file but targets
-    /users/self/files instead of /courses/:id/files. Used to produce file IDs
-    suitable for attaching to Conversations messages.
-    """
-    p = Path(local_path)
-    if not p.exists():
-        raise CanvasError(f"Local file not found: {local_path}")
-    if not p.is_file():
-        raise CanvasError(f"Path is not a file: {local_path}")
-
-    name = display_name or p.name
-    size = p.stat().st_size
-    mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
-
-    # Step 1: Request an upload slot in the user's "conversation attachments" folder.
+    """Upload a file to the authenticated user's conversation attachments."""
     # Canvas requires attachment_ids[] to reference files in this specific folder.
-    slot_data: dict[str, Any] = {
-        "name": name, "size": size, "content_type": mime,
-        "parent_folder_path": "conversation attachments",
-    }
-    async with _canvas_client(timeout=REQUEST_TIMEOUT) as client:
-        r1 = await client.post(f"{API_BASE}/users/self/files",
-                               headers=_headers(), data=slot_data)
-        r1.raise_for_status()
-        slot = r1.json()
-
-    upload_url: str = slot["upload_url"]
-    upload_params: dict[str, str] = {k: str(v) for k, v in
-                                      slot.get("upload_params", {}).items()}
-    file_param: str = slot.get("file_param", "file")
-
-    # Step 2: POST file to the pre-signed URL (no auth header).
-    file_bytes = p.read_bytes()
-    files = {file_param: (name, file_bytes, mime)}
-    async with _canvas_client(timeout=120.0, follow_redirects=False,
-                              headers={"Accept": "*/*"}) as client:
-        r2 = await client.post(upload_url, data=upload_params, files=files)
-        if r2.status_code in (301, 302, 303):
-            # Step 3: S3 path — follow redirect to Canvas confirm URL (needs auth).
-            confirm_url = r2.headers["location"]
-            async with _canvas_client(timeout=REQUEST_TIMEOUT) as c3:
-                r3 = await c3.get(confirm_url, headers=_headers())
-                r3.raise_for_status()
-                return r3.json()
-        r2.raise_for_status()
-        return r2.json()
+    return await _upload_file("/users/self/files", local_path, display_name,
+                              "conversation attachments")
 
 
 # --------------------------------------------------------------------------- #
 # New tools: upload file, get submission, send message
 # --------------------------------------------------------------------------- #
 
-@mcp.tool(
+@_tool(
     name="canvas_upload_file",
     annotations={"title": "Upload File to Canvas", "readOnlyHint": False,
                  "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
@@ -2641,7 +2687,7 @@ async def canvas_upload_file(params: UploadFileInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_get_submission",
     annotations={"title": "Get Submission Detail", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -2745,7 +2791,7 @@ async def canvas_get_submission(params: GetSubmissionInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_send_message",
     annotations={"title": "Send Canvas Inbox Message", "readOnlyHint": False,
                  "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
@@ -2837,7 +2883,7 @@ async def canvas_send_message(params: SendMessageInput) -> str:
 # Course tab tools — People, Home, Conferences, Collaborations, Outcomes, Tabs
 # --------------------------------------------------------------------------- #
 
-@mcp.tool(
+@_tool(
     name="canvas_list_tabs",
     annotations={"title": "List Course Tabs", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -2872,7 +2918,7 @@ async def canvas_list_tabs(params: ListTabsInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_get_home_page",
     annotations={"title": "Get Course Home Page", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -2907,7 +2953,7 @@ async def canvas_get_home_page(params: GetHomePageInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_list_people",
     annotations={"title": "List Course People", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -2979,7 +3025,7 @@ async def canvas_list_people(params: ListPeopleInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_list_conferences",
     annotations={"title": "List Course Conferences", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -3029,7 +3075,7 @@ async def canvas_list_conferences(params: ListConferencesInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_list_collaborations",
     annotations={"title": "List Course Collaborations", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -3070,7 +3116,7 @@ async def canvas_list_collaborations(params: ListCollaborationsInput) -> str:
         return _handle_api_error(e)
 
 
-@mcp.tool(
+@_tool(
     name="canvas_list_outcomes",
     annotations={"title": "List Course Outcomes", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -3123,7 +3169,7 @@ class ListToolsInput(_Base):
     pass
 
 
-@mcp.tool(
+@_tool(
     name="canvas_list_tools",
     annotations={"title": "List Available Canvas Tools", "readOnlyHint": True,
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
@@ -3140,6 +3186,10 @@ async def canvas_list_tools(params: ListToolsInput) -> str:
         str: Every tool name and a one-line description, grouped by category.
     """
     groups = [
+        ("Code Mode (best for multi-step or cross-course questions)", [
+            ("canvas_run_code", "Run a JavaScript snippet against a read-only Canvas API; only its printed output comes back."),
+            ("canvas_run_code_write", "Same, but the script may also call the write tools (pass confirm: true to act)."),
+        ]),
         ("Profile & courses", [
             ("canvas_get_profile", "Verify the token and see whose account is connected."),
             ("canvas_list_courses", "List your courses, with term and current grade."),
@@ -3195,6 +3245,278 @@ async def canvas_list_tools(params: ListToolsInput) -> str:
             lines.append(f"- **{name}** — {desc}")
         lines.append("")
     return "\n".join(lines).rstrip()
+
+
+# --------------------------------------------------------------------------- #
+# Code Mode — run model-written JavaScript against a read-only Canvas API
+# --------------------------------------------------------------------------- #
+# Idea from https://blog.cloudflare.com/code-mode/: instead of chaining many
+# tool calls (each result round-tripping through the model's context), the model
+# writes one script that calls the API, filters/joins the data, and prints only
+# the answer. The script runs in Deno with zero permissions (sandbox_runner.js);
+# every Canvas call is proxied back here, GET-only, so the token never enters
+# the sandbox and writes still go through the confirm-gated tools.
+
+SANDBOX_RUNNER = Path(__file__).resolve().parent / "sandbox_runner.js"
+CODE_TIMEOUT = 120.0      # wall-clock seconds for one script
+CODE_MAX_CALLS = 300      # Canvas calls one script may make
+CODE_OUTPUT_LIMIT = 30000  # characters of output returned to the model
+
+
+def _deno_path() -> Optional[str]:
+    """Locate deno; GUI-launched clients often have a PATH without Homebrew."""
+    import shutil
+    candidates = [os.environ.get("DENO_PATH"), shutil.which("deno"),
+                  "/opt/homebrew/bin/deno", "/usr/local/bin/deno",
+                  str(Path.home() / ".deno/bin/deno")]
+    return next((c for c in candidates if c and Path(c).is_file()), None)
+
+
+def _api_path(path: Any) -> str:
+    """Validate a sandbox-supplied Canvas API path (relative to /api/v1)."""
+    if (not isinstance(path, str) or not path.startswith("/") or path.startswith("//")
+            or ".." in path or "://" in path or "\\" in path):
+        raise CanvasError(f"path must look like '/courses/123/assignments', got {path!r}")
+    return path
+
+
+async def _code_file_text(file_id: Any, limit: Any) -> Optional[str]:
+    """Text of a Canvas file (PDF text layer or text-like file); None if binary."""
+    f = await _get(f"/files/{int(file_id)}")
+    url, size = f.get("url"), f.get("size")
+    name = f.get("display_name") or f.get("filename") or ""
+    ctype = str(f.get("content-type") or f.get("content_type") or "").lower()
+    if not url:
+        return None
+    if "pdf" not in ctype and not name.lower().endswith(".pdf"):
+        return await _fetch_text(url, limit=int(limit))
+    if isinstance(size, int) and size > 15 * 1024 * 1024:
+        raise CanvasError(f"PDF {name} is over 15 MB; not extracted")
+    async with _canvas_client(timeout=REQUEST_TIMEOUT, follow_redirects=True,
+                              headers={"Accept": "*/*"}) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+    return _extract_pdf_text(resp.content, limit=int(limit))
+
+
+async def _code_tool(name: Any, args: Any, allow_writes: bool) -> str:
+    """Run one of this server's tools from inside a script. Write tools only
+    when the script came through canvas_run_code_write."""
+    # shortcut: uses FastMCP's private _tool_manager; revisit if an mcp upgrade breaks it.
+    tool = mcp._tool_manager.get_tool(str(name))
+    hints = getattr(tool, "annotations", None)
+    if tool is None or str(name).startswith("canvas_run_code"):
+        raise CanvasError(f"{name!r} is not a Canvas tool callable from a script")
+    if not allow_writes and not getattr(hints, "readOnlyHint", False):
+        raise CanvasError(f"{name!r} writes to Canvas; use canvas_run_code_write")
+    return await tool.run({"params": args or {}}, convert_result=False)
+
+
+async def _code_dispatch(method: str, args: list[Any], allow_writes: bool) -> Any:
+    if method == "get":
+        return await _get(_api_path(args[0]), args[1])
+    if method == "getAll":
+        return await _paginated_get(_api_path(args[0]), args[1],
+                                    max_items=min(int(args[2]), 2000))
+    if method == "courses":
+        return await _fetch_courses("active")
+    if method == "fileText":
+        return await _code_file_text(args[0], args[1])
+    if method == "htmlToText":
+        return _strip_html(args[0], limit=int(args[1]))
+    if method == "course":
+        return await _resolve_course(args[0])
+    if method == "tool":
+        return await _code_tool(args[0], args[1], allow_writes)
+    raise CanvasError(f"unknown canvas method {method!r}")
+
+
+def _rpc_error(e: Exception) -> str:
+    return _handle_api_error(e).removeprefix("Error: ")
+
+
+async def _run_sandbox(code: str, allow_writes: bool = False) -> dict[str, Any]:
+    """Run `code` in the Deno sandbox, serving its canvas.* calls. Returns the
+    runner's final message: {logs, result, error}."""
+    deno = _deno_path()
+    if not deno:
+        raise CanvasError("Code Mode needs Deno. Install it with `brew install deno` "
+                          "(or set DENO_PATH), then restart the MCP server.")
+    env = {"HOME": str(Path.home()), "PATH": "/usr/bin:/bin", "NO_COLOR": "1",
+           "DENO_NO_UPDATE_CHECK": "1"}  # deliberately no CANVAS_API_TOKEN
+    proc = await asyncio.create_subprocess_exec(
+        deno, "run", "--no-prompt", "--no-remote", "--no-npm", "--no-config",
+        "--no-lock", "--v8-flags=--max-old-space-size=256", str(SANDBOX_RUNNER),
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, env=env, limit=32 * 1024 * 1024)
+    assert proc.stdin and proc.stdout and proc.stderr
+    stderr_task = asyncio.create_task(proc.stderr.read())
+    sem = asyncio.Semaphore(SWEEP_CONCURRENCY)
+    calls = 0
+    tasks: set[asyncio.Task] = set()
+
+    def reply(msg: dict[str, Any]) -> None:
+        if not proc.stdin.is_closing():
+            proc.stdin.write((json.dumps(msg, default=str) + "\n").encode())
+
+    async def serve(msg: dict[str, Any]) -> None:
+        try:
+            async with sem:
+                value = await _code_dispatch(msg.get("m", ""), list(msg.get("a") or []),
+                                             allow_writes)
+            reply({"id": msg["id"], "ok": True, "v": value})
+        except Exception as e:  # noqa: BLE001
+            reply({"id": msg["id"], "ok": False, "e": _rpc_error(e)})
+
+    async def pump() -> dict[str, Any]:
+        nonlocal calls
+        proc.stdin.write((json.dumps({"code": code, "tz": LOCAL_TZ_NAME}) + "\n").encode())
+        while line := await proc.stdout.readline():
+            msg = json.loads(line)
+            if msg.get("t") == "done":
+                return msg
+            calls += 1
+            if calls > CODE_MAX_CALLS:
+                reply({"id": msg["id"], "ok": False,
+                       "e": f"call limit reached ({CODE_MAX_CALLS} per script)"})
+                continue
+            task = asyncio.create_task(serve(msg))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+        err = (await stderr_task).decode(errors="replace").strip()
+        raise CanvasError(f"sandbox exited without a result: {err[-1500:] or 'no output'}")
+
+    try:
+        result = await asyncio.wait_for(pump(), CODE_TIMEOUT)
+        result["calls"] = calls
+        return result
+    except asyncio.TimeoutError:
+        raise CanvasError(f"script timed out after {CODE_TIMEOUT:.0f}s") from None
+    finally:
+        for t in tasks:
+            t.cancel()
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+        stderr_task.cancel()
+
+
+class RunCodeInput(_Base):
+    code: str = Field(..., min_length=1, max_length=50000,
+                      description="Body of an async JavaScript function. Use `await canvas.*`, "
+                                  "console.log what you need, and/or `return` a JSON value.")
+
+
+@_tool(
+    name="canvas_run_code",
+    annotations={"title": "Run Code Against Canvas (read-only)", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def canvas_run_code(params: RunCodeInput) -> str:
+    """Run a JavaScript snippet against a read-only Canvas API — "Code Mode".
+
+    Prefer this over chaining several tools whenever an answer needs more than
+    one or two Canvas calls, spans several courses, or needs filtering, joining,
+    counting, or sorting. The script runs server-side; only what you console.log
+    or return comes back, so large intermediate data never fills your context.
+
+    `code` is the BODY of an async function (top-level await and `return` work).
+    Plain JavaScript only — no TypeScript annotations, no imports. Sandboxed:
+    no network, files, or env; the only way out is the `canvas` object:
+
+    ```ts
+    declare const canvas: {
+      tz: string;  // account timezone, e.g. "Asia/Manila"
+      // GET {base}/api/v1{path}. Any Canvas REST GET endpoint; params may use
+      // Canvas array keys, e.g. {"include[]": ["submission"], "bucket": "upcoming"}.
+      get(path: string, params?: object): Promise<any>;
+      // Same, following pagination; returns the concatenated array (cap maxItems, default 500).
+      getAll(path: string, params?: object, maxItems?: number): Promise<any[]>;
+      // Active courses (term + total_scores included). Fields: id, name, course_code, term, enrollments.
+      courses(): Promise<any[]>;
+      // Course ID from an ID, code, or name, e.g. canvas.course("THEO 13"). Throws if ambiguous.
+      course(ref: string | number): Promise<number>;
+      // Text of a Canvas file: PDF text layer or text-like file; null if binary.
+      fileText(fileId: number, limit?: number): Promise<string | null>;
+      htmlToText(html: string, limit?: number): Promise<string>;
+      // Run any read-only canvas_* tool by name with its usual params; returns its
+      // Markdown. e.g. canvas.tool("canvas_list_upcoming", {days_ahead: 14}) — includes the overdue
+      // and graded-discussion sweeps that raw endpoints miss.
+      tool(name: string, args?: object): Promise<string>;
+      fmt(iso: string | null): string;  // "YYYY-MM-DD HH:MM" in canvas.tz
+    };
+    ```
+
+    Useful endpoints: /users/self, /courses/:id/assignments (include[]=submission),
+    /courses/:id/assignment_groups (include[]=assignments — category weights),
+    /courses/:id/discussion_topics, /courses/:id/discussion_topics/:id/view,
+    /announcements?context_codes[]=course_:id, /courses/:id/modules?include[]=items,
+    /courses/:id/pages/:url, /courses/:id/files?search_term=, /courses/:id/quizzes,
+    /users/self/todo, /planner/items?start_date=, /courses/:id/students/submissions.
+
+    Example:
+    ```js
+    const out = [];
+    for (const c of await canvas.courses()) {
+      const as = await canvas.getAll(`/courses/${c.id}/assignments`, {"include[]": ["submission"], bucket: "upcoming"});
+      for (const a of as) if (a.points_possible >= 20) out.push(`${c.course_code}: ${a.name} — ${canvas.fmt(a.due_at)}`);
+    }
+    console.log(out.join("\n") || "none");
+    ```
+
+    Writes (submit, post, message, upload) are NOT available here — use
+    canvas_run_code_write or the canvas_* write tools. Limits: 120 s, 300
+    Canvas calls, output truncated at 30,000 characters. Failed canvas.* calls throw.
+
+    Returns:
+        str: Captured console output, then the returned value as JSON.
+    """
+    return await _code_output(params.code, allow_writes=False)
+
+
+@_tool(
+    name="canvas_run_code_write",
+    annotations={"title": "Run Code Against Canvas (can write)", "readOnlyHint": False,
+                 "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+)
+async def canvas_run_code_write(params: RunCodeInput) -> str:
+    """Same sandbox and `canvas` API as canvas_run_code, but canvas.tool() may
+    also call the write tools, so one script can read and then act — e.g. find
+    every unanswered graded discussion and post the entries the user approved.
+
+    Write tools available through canvas.tool(name, args): canvas_submit_assignment,
+    canvas_post_discussion_entry, canvas_reply_to_entry,
+    canvas_post_submission_comment, canvas_send_message, canvas_upload_file,
+    canvas_create_planner_note. Args are each tool's usual params. Without
+    `confirm: true` a write tool returns a preview and sends nothing; with it,
+    the write happens. Course args accept codes/names like "THEO 13".
+
+    Use canvas_run_code for anything read-only. Before confirming writes, show
+    the user what will be written unless they already approved those exact
+    actions. Nothing can delete. Same limits as canvas_run_code.
+
+    Returns:
+        str: Captured console output, then the returned value as JSON.
+    """
+    return await _code_output(params.code, allow_writes=True)
+
+
+async def _code_output(code: str, allow_writes: bool) -> str:
+    try:
+        res = await _run_sandbox(code, allow_writes)
+    except Exception as e:  # noqa: BLE001
+        return _handle_api_error(e)
+    parts = list(res.get("logs") or [])
+    if res.get("result") is not None:
+        r = res["result"]
+        parts.append(r if isinstance(r, str) else json.dumps(r, indent=1, ensure_ascii=False))
+    if res.get("error"):
+        parts.append(f"Error in script: {res['error']}")
+    text = "\n".join(parts).strip() or "(script produced no output — console.log or return something)"
+    if len(text) > CODE_OUTPUT_LIMIT:
+        text = (text[:CODE_OUTPUT_LIMIT].rstrip()
+                + f"\n…[truncated at {CODE_OUTPUT_LIMIT} characters — print less]")
+    return text
 
 
 # --------------------------------------------------------------------------- #

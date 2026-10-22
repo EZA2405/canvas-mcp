@@ -1,5 +1,74 @@
 # STATE
 
+## 2026-10-23 (later) — Course names and write-capable Code Mode
+
+### Changed
+
+- Every `course_id`, `course_ids`, and `exclude_course_ids` field is
+  `CourseRef` (int or string). All tools register through `_tool()`, which
+  resolves strings via `_resolve_course` before the tool body runs. Matching
+  checks active courses, then completed ones, with a 10-minute cache. Exact
+  code/name matches win. Otherwise every query token must match: digits whole
+  ("13" never matches "131"), words as prefixes. Ambiguity returns an error
+  listing the candidates.
+- New tool `canvas_run_code_write` (`destructiveHint: true`): same sandbox, but
+  `canvas.tool()` may call write tools. Writes still need `confirm: true`;
+  nothing deletes. `canvas_run_code` stays read-only so reads need no approval.
+- Sandbox API gained `canvas.course(ref)`.
+
+### Verified
+
+- Live, before Canvas went unreachable: "THEO 13", "theo13", "FAA 111.20",
+  "itent 120", "philosophy of religion", and "swimming" resolved correctly.
+  "PE" returned the ambiguity list. `canvas_list_assignments` and
+  `canvas_list_announcements` worked with names.
+- Over MCP: 36 tools listed and the course_id schema shows int-or-string.
+  Measured tool definitions are about 14.6k tokens in total; the two code
+  tools are about 1.4k.
+- 11 unit tests pass, including resolver ambiguity, write-tool blocking in
+  read mode, and write-mode dry-run.
+
+### Not verified
+
+- `ateneo.instructure.com` stopped responding mid-session (curl timeouts,
+  other sites fine). The live classic-vs-Code-Mode timing comparison and a
+  live `canvas_run_code_write` call were not completed. Re-run them once
+  Canvas responds.
+
+## 2026-10-23 — Code Mode (`canvas_run_code`)
+
+### Changed
+
+- New read-only tool `canvas_run_code`, modeled on Cloudflare's Code Mode. The
+  model writes a JavaScript function body; `sandbox_runner.js` runs it in Deno
+  with no `--allow-*` flags. Its `canvas.*` calls (`get`, `getAll`, `courses`,
+  `fileText`, `htmlToText`, `tool`, `fmt`) are JSON-RPC over stdio to the
+  Python server, which validates the path and makes GET-only Canvas requests.
+  The token is not in the sandbox's environment. `canvas.tool` runs only tools
+  annotated `readOnlyHint`.
+- User code is evaluated via `AsyncFunction`, not written into the main module:
+  Deno preloads string-literal `import()` calls in a main module without a read
+  permission check. Inside eval'd code those imports are permission-checked.
+- Deno is located via `DENO_PATH`, `PATH`, then Homebrew/`~/.deno` fallbacks,
+  because GUI clients launch with a minimal PATH.
+
+### Verified
+
+- Live: profile, a 13-course upcoming-assignment sweep (1.8 s, one tool call),
+  assignment-group weights, and `canvas.tool("canvas_list_upcoming")`.
+- Over MCP stdio with `PATH=/usr/bin:/bin`: 35 tools listed, `canvas_run_code`
+  returns real data.
+- Blocked: network `fetch`, file reads, local and remote `import()`, env
+  access, subprocesses, non-API paths, `..` traversal, write tools, and calls
+  past the call limit. `tests/test_code_mode.py` covers these cases, with
+  Canvas mocked.
+- Run tests with `PYTHONPATH=. ./venv/bin/python -m unittest tests.test_code_mode tests.test_uploads`.
+
+### Not done
+
+- The existing 34 tools are unchanged. Clients still load every tool definition
+  at startup.
+
 ## 2026-09-16 — Claude Desktop/Cowork proxy compatibility
 
 ### Changed
