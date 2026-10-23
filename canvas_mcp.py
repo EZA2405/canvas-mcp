@@ -1417,6 +1417,15 @@ async def _fetch_text(url: str, limit: int = HTML_TEXT_LIMIT) -> Optional[str]:
         return text
 
 
+async def _download_bytes(url: str) -> bytes:
+    """Download a (signed) Canvas file URL. No auth header: the URL is pre-signed."""
+    async with _canvas_client(timeout=REQUEST_TIMEOUT, follow_redirects=True,
+                              headers={"Accept": "*/*"}) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.content
+
+
 def _extract_pdf_text(content: bytes, limit: int = HTML_TEXT_LIMIT,
                       max_pages: int = 40) -> str:
     """Best-effort text extraction from PDF bytes. Returns '' if the PDF parses
@@ -1938,12 +1947,7 @@ async def canvas_get_file(params: GetFileInput) -> str:
                            f"to extract automatically. Use the download URL above.)_")
             else:
                 try:
-                    async with _canvas_client(timeout=REQUEST_TIMEOUT,
-                                              follow_redirects=True,
-                                              headers={"Accept": "*/*"}) as client:
-                        resp = await client.get(url)
-                        resp.raise_for_status()
-                        content = resp.content
+                    content = await _download_bytes(url)
                 except Exception:  # noqa: BLE001
                     content = b""
                 extraction_failed = False
@@ -2274,10 +2278,7 @@ async def canvas_list_calendar_events(params: CalendarInput) -> str:
     """
     try:
         start = params.start_date or _now().date().isoformat()
-        if params.end_date:
-            end = params.end_date
-        else:
-            end = (_now() + timedelta(days=14)).date().isoformat()
+        end = params.end_date or (_now() + timedelta(days=14)).date().isoformat()
 
         if params.course_id:
             contexts = [f"course_{params.course_id}"]
@@ -2845,7 +2846,7 @@ async def canvas_get_submission(params: GetSubmissionInput) -> str:
         if body:
             lines += ["", "### Submission Body", _strip_html(body, limit=2000)]
         if sub.get("url"):
-            lines += ["", f"### Submitted URL", sub["url"]]
+            lines += ["", "### Submitted URL", sub["url"]]
 
         # Rubric assessment.
         rubric_assessment = sub.get("rubric_assessment") or {}
@@ -3384,11 +3385,7 @@ async def _code_file_text(file_id: Any, limit: Any) -> Optional[str]:
         return await _fetch_text(url, limit=int(limit))
     if isinstance(size, int) and size > 15 * 1024 * 1024:
         raise CanvasError(f"PDF {name} is over 15 MB; not extracted")
-    async with _canvas_client(timeout=REQUEST_TIMEOUT, follow_redirects=True,
-                              headers={"Accept": "*/*"}) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-    return _extract_pdf_text(resp.content, limit=int(limit))
+    return _extract_pdf_text(await _download_bytes(url), limit=int(limit))
 
 
 async def _code_tool(name: Any, args: Any, allow_writes: bool) -> str:
