@@ -1,5 +1,42 @@
 # STATE
 
+## 2026-10-23 (evening) — Downloads, file submission, speed
+
+### Changed
+
+- New `canvas_download_file`: saves a Canvas file to `~/Downloads/Canvas`
+  (`CANVAS_DOWNLOAD_DIR` or `dest_dir` override). It streams to a `.part`
+  file, then renames, and never overwrites: a clash gets " (2)". It is not
+  read-only (it writes local disk), so Code Mode can reach it only via
+  `canvas_run_code_write`.
+- `canvas_submit_assignment` takes `local_paths` for `online_upload`. Files
+  are checked in the preview and uploaded via
+  `/courses/:id/assignments/:id/submissions/self/files` only on
+  `confirm=true`. Before this, file submission needed pre-uploaded IDs, and
+  the only upload tool targets course Files, which students usually get 403 on.
+- PDF text uses pypdf layout mode with whitespace collapsed, falling back to
+  plain mode. Ateneo syllabi used to come out one word per line.
+
+### Verified live
+
+- Downloaded "ITENT Capstone Syllabus.pdf" (238 KB, 8 pages) in 2.9 s;
+  `file` confirms a valid PDF. The September inst-fs HTTP 406 did not recur.
+- `canvas_get_file` PDF text is readable now.
+- Speed over MCP: a cross-course upcoming-assignment sweep took 14 classic
+  calls and 5.6 s of server time (40 s in a run with one timeout), about
+  645 tokens of results. Code Mode took 1 call, 1.4 s, about 170 tokens.
+  The classic path also pays model latency for each of its 14 turns.
+- 15 offline tests pass (`tests.test_files` is new).
+
+### Not verified / notes
+
+- A live file submission was not attempted, because it would hand in graded
+  work. The mocked test covers preview, upload, and submit.
+- Many courses return 403 on `/courses/:id/files` (Files tab hidden). Their
+  syllabi live in modules or pages, so look there.
+- The earlier "Canvas unreachable" periods were the Mac's DNS failing (60 s
+  lookups, even to 1.1.1.1), plus this shell's sandbox. Canvas itself was up.
+
 ## 2026-10-23 (later) — Course names and write-capable Code Mode
 
 ### Changed
@@ -28,12 +65,16 @@
 - 11 unit tests pass, including resolver ambiguity, write-tool blocking in
   read mode, and write-mode dry-run.
 
+- Live write verified 2026-10-23 over MCP stdio with a minimal PATH. A
+  `canvas_run_code_write` script with `course_id: "THEO 13"` returned the dry
+  run first, then with `confirm: true` created planner note 39387 for
+  2026-10-24 on course 70437. A read-back via `canvas_run_code` confirmed it.
+  The note is still on the account; delete it from the Canvas planner.
+
 ### Not verified
 
-- `ateneo.instructure.com` stopped responding mid-session (curl timeouts,
-  other sites fine). The live classic-vs-Code-Mode timing comparison and a
-  live `canvas_run_code_write` call were not completed. Re-run them once
-  Canvas responds.
+- The live classic-vs-Code-Mode timing comparison was not run because Canvas
+  was unreachable at the time.
 
 ## 2026-10-23 — Code Mode (`canvas_run_code`)
 

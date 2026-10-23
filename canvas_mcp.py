@@ -1434,12 +1434,18 @@ def _extract_pdf_text(content: bytes, limit: int = HTML_TEXT_LIMIT,
             pages_text.append(
                 f"\n…[{len(reader.pages) - max_pages} more page(s) not extracted]")
             break
+        # Plain mode puts each word on its own line for some PDFs (Ateneo
+        # syllabi); layout mode keeps lines and tables, padded with spaces.
         try:
-            pages_text.append(page.extract_text() or "")
+            pages_text.append(page.extract_text(extraction_mode="layout") or "")
         except Exception:  # noqa: BLE001
-            continue
+            try:
+                pages_text.append(page.extract_text() or "")
+            except Exception:  # noqa: BLE001
+                continue
     text = "\n\n".join(t for t in pages_text if t.strip())
-    text = text.strip()
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text).strip()
     if len(text) > limit:
         text = text[:limit].rstrip() + "\n…[truncated]"
     return text
@@ -1545,6 +1551,17 @@ class GetFileInput(_Base):
                     "layer extracted (best effort — layout and images are lost, "
                     "large files are skipped). Other binary files (docx, images) "
                     "return metadata and a download URL only.")
+
+
+DOWNLOAD_DIR = Path(os.environ.get("CANVAS_DOWNLOAD_DIR", "~/Downloads/Canvas")).expanduser()
+
+
+class DownloadFileInput(_Base):
+    file_id: int = Field(..., description="Canvas file ID (from canvas_list_files, "
+                                          "modules, or an assignment).", ge=1)
+    dest_dir: Optional[str] = Field(
+        default=None,
+        description=f"Folder to save into. Defaults to {DOWNLOAD_DIR}. Created if missing.")
 
 
 class ListDiscussionsInput(_Base):
@@ -1676,8 +1693,12 @@ class SubmitAssignmentInput(_Base):
         default=None, description="URL to submit. Required for online_url.")
     file_ids: Optional[list[int]] = Field(
         default=None,
-        description="Canvas file IDs to attach. Required for online_upload. The files "
-                    "must already be uploaded to your Canvas account.")
+        description="Canvas file IDs already uploaded for this submission. For "
+                    "online_upload, prefer local_paths.")
+    local_paths: Optional[list[str]] = Field(
+        default=None,
+        description="For online_upload: absolute paths of files on this computer. "
+                    "They are uploaded to the assignment and submitted on confirm.")
     confirm: bool = _CONFIRM
 
 
@@ -1960,6 +1981,62 @@ async def canvas_get_file(params: GetFileInput) -> str:
                 out.append("\n_(Binary file — not inlined. Use the download URL "
                            "above to open it.)_")
         return "\n".join(out)
+    except Exception as e:  # noqa: BLE001
+        return _handle_api_error(e)
+
+
+def _free_path(folder: Path, name: str) -> Path:
+    """folder/name, or 'name (2).ext' etc. — never overwrites an existing file."""
+    name = Path(name.replace("\\", "/")).name or "download"
+    path = folder / name
+    n = 2
+    while path.exists():
+        path = folder / f"{Path(name).stem} ({n}){Path(name).suffix}"
+        n += 1
+    return path
+
+
+@_tool(
+    name="canvas_download_file",
+    annotations={"title": "Download File to This Computer", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def canvas_download_file(params: DownloadFileInput) -> str:
+    """Save a Canvas file (syllabus PDF, slides, worksheet, …) to this computer.
+
+    Saves into ~/Downloads/Canvas by default (or dest_dir). Never overwrites: a
+    name clash gets a " (2)" suffix. Changes nothing on Canvas. To read a file's
+    text instead of saving it, use canvas_get_file.
+
+    Args:
+        params.file_id: Canvas file ID.
+        params.dest_dir: Optional destination folder.
+
+    Returns:
+        str: The saved file's full path and size.
+    """
+    try:
+        f = await _get(f"/files/{params.file_id}")
+        url = f.get("url")
+        if not url:
+            return ("Error: Canvas gave no download link for this file — it may be "
+                    "locked or not yet published to students.")
+        folder = Path(params.dest_dir).expanduser() if params.dest_dir else DOWNLOAD_DIR
+        folder.mkdir(parents=True, exist_ok=True)
+        dest = _free_path(folder, f.get("display_name") or f.get("filename") or "download")
+        part = dest.with_name(dest.name + ".part")
+        try:
+            async with _canvas_client(timeout=120.0, follow_redirects=True,
+                                      headers={"Accept": "*/*"}) as client:
+                async with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    with part.open("wb") as out:
+                        async for chunk in resp.aiter_bytes():
+                            out.write(chunk)
+            part.rename(dest)
+        finally:
+            part.unlink(missing_ok=True)
+        return f"✅ Saved {dest} ({dest.stat().st_size / 1024:.0f} KB)"
     except Exception as e:  # noqa: BLE001
         return _handle_api_error(e)
 
@@ -2396,15 +2473,15 @@ async def canvas_create_planner_note(params: CreatePlannerNoteInput) -> str:
 async def canvas_submit_assignment(params: SubmitAssignmentInput) -> str:
     """Submit work to an assignment. WRITE — gated by confirm.
 
-    Supports text entries, URL submissions, and file uploads (by file ID; the file
-    must already be uploaded to Canvas). The first call returns a preview including
+    Supports text entries, URL submissions, and file uploads (local_paths: files
+    on this computer, uploaded to the assignment on confirm). The first call returns a preview including
     the assignment name, due date, and your current submission state. Set
     confirm=True to actually submit.
 
     Args:
         params.course_id / params.assignment_id: Target assignment.
         params.submission_type: 'online_text_entry', 'online_url', or 'online_upload'.
-        params.body / params.url / params.file_ids: The matching payload.
+        params.body / params.url / params.local_paths (or file_ids): The matching payload.
         params.confirm: Must be True to submit.
 
     Returns:
@@ -2414,16 +2491,24 @@ async def canvas_submit_assignment(params: SubmitAssignmentInput) -> str:
         # Validate the payload matches the chosen submission type.
         need = {"online_text_entry": "body", "online_url": "url",
                 "online_upload": "file_ids"}[params.submission_type]
-        if getattr(params, need) in (None, "", []):
+        if getattr(params, need) in (None, "", []) and not (
+                need == "file_ids" and params.local_paths):
+            need = "local_paths" if need == "file_ids" else need
             return (f"Error: submission_type '{params.submission_type}' requires "
                     f"the '{need}' field, which is missing.")
+        local_files = [Path(lp).expanduser() for lp in params.local_paths or []]
+        for lf in local_files:
+            if not lf.is_file():
+                return f"Error: Local file not found: {lf}"
 
         if params.submission_type == "online_text_entry":
             payload = f"text: {_excerpt(params.body)}"
         elif params.submission_type == "online_url":
             payload = f"url: {params.url}"
         else:
-            payload = f"file IDs: {params.file_ids}"
+            payload = ", ".join([f"{lf.name} ({lf.stat().st_size / 1024:.0f} KB)"
+                                 for lf in local_files]
+                                + [f"file ID {i}" for i in params.file_ids or []])
 
         if not params.confirm:
             # Enrich the preview with what's actually being submitted to.
@@ -2446,7 +2531,13 @@ async def canvas_submit_assignment(params: SubmitAssignmentInput) -> str:
         elif params.submission_type == "online_url":
             data["submission[url]"] = params.url
         else:
-            data["submission[file_ids][]"] = params.file_ids
+            file_ids = list(params.file_ids or [])
+            for lf in local_files:
+                f = await _upload_file(f"/courses/{params.course_id}/assignments/"
+                                       f"{params.assignment_id}/submissions/self/files",
+                                       str(lf), None, None)
+                file_ids.append(f["id"])
+            data["submission[file_ids][]"] = file_ids
         sub = await _send("POST", f"/courses/{params.course_id}/assignments/"
                           f"{params.assignment_id}/submissions", data)
         return (f"✅ Submitted to assignment {params.assignment_id}. "
@@ -3214,6 +3305,7 @@ async def canvas_list_tools(params: ListToolsInput) -> str:
             ("canvas_get_home_page", "A course's front/home page body."),
             ("canvas_list_files", "Files uploaded to a course."),
             ("canvas_get_file", "A file's metadata; text and PDF content is extracted when possible."),
+            ("canvas_download_file", "Save a Canvas file (syllabus PDF, slides…) to ~/Downloads/Canvas."),
         ]),
         ("Discussions & quizzes", [
             ("canvas_list_discussions", "Discussion topics in a course."),
@@ -3231,7 +3323,7 @@ async def canvas_list_tools(params: ListToolsInput) -> str:
         ]),
         ("Write tools (all confirm-gated — first call previews, second with confirm=true acts)", [
             ("canvas_create_planner_note", "Create a personal planner note/to-do."),
-            ("canvas_submit_assignment", "Submit text/URL/file to an assignment."),
+            ("canvas_submit_assignment", "Submit text, a URL, or files from this computer to an assignment."),
             ("canvas_post_discussion_entry", "Post a new top-level discussion entry."),
             ("canvas_reply_to_entry", "Reply to a specific discussion entry."),
             ("canvas_post_submission_comment", "Comment on your own submission."),
@@ -3487,7 +3579,7 @@ async def canvas_run_code_write(params: RunCodeInput) -> str:
     Write tools available through canvas.tool(name, args): canvas_submit_assignment,
     canvas_post_discussion_entry, canvas_reply_to_entry,
     canvas_post_submission_comment, canvas_send_message, canvas_upload_file,
-    canvas_create_planner_note. Args are each tool's usual params. Without
+    canvas_create_planner_note, canvas_download_file (saves to this computer). Args are each tool's usual params. Without
     `confirm: true` a write tool returns a preview and sends nothing; with it,
     the write happens. Course args accept codes/names like "THEO 13".
 

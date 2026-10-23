@@ -47,6 +47,7 @@ was deliberately left out.
 | `canvas_get_page` | Read a Page's full body as text |
 | `canvas_list_files` | List course files (name, ID, type, size) |
 | `canvas_get_file` | File metadata; inlines text for text-based files, download URL for binaries |
+| `canvas_download_file` | Save a Canvas file to `~/Downloads/Canvas` (or `CANVAS_DOWNLOAD_DIR` / `dest_dir`); never overwrites |
 | `canvas_list_discussions` | List discussion topics in a course |
 | `canvas_get_discussion` | A topic's prompt + full threaded replies |
 | `canvas_list_quizzes` | List quizzes with due dates, points, question counts |
@@ -95,8 +96,8 @@ matches instead of guessing.
 | `canvas_post_submission_comment` | Comment on your own submission (note to grader) | Medium |
 
 `canvas_submit_assignment` supports `online_text_entry` (`body`), `online_url`
-(`url`), and `online_upload` (`file_ids` — the files must already be uploaded to
-Canvas; this tool does not perform the upload handshake).
+(`url`), and `online_upload` (`local_paths` — files on this computer, uploaded
+to the assignment only on the `confirm=true` call; `file_ids` also accepted).
 
 ## Setup
 
