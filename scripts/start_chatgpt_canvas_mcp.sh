@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077  # logs and URL file contain the secret path
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_DIR="$ROOT_DIR/.runtime"
@@ -14,7 +15,7 @@ mkdir -p "$RUNTIME_DIR"
 
 screen -S "$TUNNEL_SESSION" -X quit >/dev/null 2>&1 || true
 screen -S "$SERVER_SESSION" -X quit >/dev/null 2>&1 || true
-rm -f "$URL_FILE"
+rm -f "$URL_FILE" "$RUNTIME_DIR/http-secret"
 : > "$SERVER_LOG"
 : > "$TUNNEL_LOG"
 
@@ -39,8 +40,9 @@ screen -dmS "$TUNNEL_SESSION" bash -lc \
 for _ in {1..120}; do
   url="$(grep -Eo 'https://[a-z0-9]+-[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" | tail -1 || true)"
   if [[ -n "${url:-}" ]]; then
-    echo "$url/mcp" > "$URL_FILE"
-    echo "ChatGPT Canvas MCP URL: $url/mcp"
+    secret="$(cat "$RUNTIME_DIR/http-secret")"
+    (umask 077 && echo "$url/mcp/$secret" > "$URL_FILE")
+    echo "ChatGPT Canvas MCP URL (keep it private; it is the key): $url/mcp/$secret"
     echo "Logs: $SERVER_LOG and $TUNNEL_LOG"
     echo "If the URL is not reachable immediately, wait 15-30 seconds and retry; Cloudflare quick-tunnel DNS can lag."
     exit 0

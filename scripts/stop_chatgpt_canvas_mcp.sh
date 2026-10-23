@@ -10,4 +10,4 @@ listeners="$(lsof -tiTCP:8765 -sTCP:LISTEN || true)"
 if [[ -n "$listeners" ]]; then
   kill $listeners >/dev/null 2>&1 || true
 fi
-rm -f "$RUNTIME_DIR/chatgpt-mcp-url.txt"
+rm -f "$RUNTIME_DIR/chatgpt-mcp-url.txt" "$RUNTIME_DIR/http-secret"

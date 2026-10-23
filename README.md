@@ -77,15 +77,27 @@ answer — faster, and it keeps large raw data out of Claude's context.
   the script passes `confirm: true`. Nothing can delete.
 - Limits per script: 120 seconds, 300 Canvas calls, 30,000 characters of output.
 
+## Local file and network safety
+
+- Tools read or write local files only inside `~/Downloads`, `~/Desktop`, and
+  `~/Documents` (override with `CANVAS_FILE_ROOTS`, colon-separated). Hidden
+  files and folders (`.env`, `.ssh`, …) and this server's own folder are always
+  refused. Symlinks are resolved before checking.
+- The ChatGPT quick tunnel (`scripts/start_chatgpt_canvas_mcp.sh`) serves the
+  MCP endpoint at `/mcp/<random secret>`, regenerated on every start. Every
+  other path returns 404. Treat the printed URL like a password.
+- `.runtime/` (tunnel logs, PIDs, the secret) is git-ignored.
+
 ## Lean mode (`CANVAS_TOOLSET=lean`)
 
-Set `CANVAS_TOOLSET=lean` in a client's env block to expose only 9 tools:
+`CANVAS_TOOLSET=lean` is set in `.env`, so every client gets it unless its
+own env block overrides it (Claude Desktop rewrites its config file and drops
+added keys, so it can't be set there). It exposes only 9 tools:
 read-only `canvas_run_code` plus the individual write tools (download, planner
 note, submit, post, reply, comment, upload, message). Every other read tool stays
 reachable from scripts via `canvas.tool(...)`. Tool definitions drop from about
 15,000 to about 3,700 tokens per chat, and no script ever needs write approval.
-Claude Desktop uses lean mode. Claude Code keeps the full set (the default),
-because it already loads tool definitions on demand.
+To give one client the full set, add `CANVAS_TOOLSET=full` to its env block.
 
 ## Course names instead of IDs
 

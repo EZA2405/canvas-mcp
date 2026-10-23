@@ -10,6 +10,11 @@ import canvas_mcp as canvas
 
 
 class UploadTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        roots = patch.object(canvas, "FILE_ROOTS", [Path(tempfile.gettempdir()).resolve()])
+        roots.start()
+        self.addCleanup(roots.stop)
+
     async def test_upload_protocol(self):
         with tempfile.TemporaryDirectory() as directory:
             local_path = Path(directory) / "note.txt"

@@ -1,5 +1,47 @@
 # STATE
 
+## 2026-10-23 (late) — Security lock-down
+
+### Changed
+
+- `_safe_path` checks every local path the tools touch: upload,
+  submission/message attachments, and download destination. A path must
+  resolve, symlinks included, inside `FILE_ROOTS` (default Downloads,
+  Desktop, Documents; `CANVAS_FILE_ROOTS` overrides). It must not be under
+  this server's folder or contain a hidden component. Field descriptions tell
+  the model the allowed folders.
+- ChatGPT quick tunnel: `run_canvas_http.py` serves at `/mcp/<token_urlsafe(32)>`,
+  regenerated each start and written to `.runtime/http-secret` (0600). The
+  start script prints the full URL and uses `umask 077` for logs and the URL
+  file. The stop script deletes the secret.
+- Lean mode moved to `.env` (`CANVAS_TOOLSET=lean`). Claude Desktop rewrote
+  its config twice within minutes and dropped the key. Every client is now
+  lean unless its env block sets `CANVAS_TOOLSET=full`.
+- `.runtime/` and `.DS_Store` are git-ignored and untracked (files are kept
+  on disk), and so is `scripts/__pycache__`.
+
+### Verified
+
+- 20 tests pass, including `_safe_path` (hidden files, symlink to
+  /etc/hosts, `..` escape, the server folder) and tool-level refusals.
+- Live over MCP with no env vars: 9 tools load. Attaching `.env` or
+  `~/.ssh/id_rsa` is refused, and so is downloading to `/tmp`. A normal
+  download to `~/Downloads/Canvas` works.
+- Local HTTP: `/mcp`, `/mcp/`, a wrong secret, and `/` all return 404; the
+  secret path connects.
+- Token audit (by match count, never printed): 0 matches in git history,
+  tracked files, and `.runtime` logs. The repo has no remote. Copies exist in
+  `.env`, `~/.codex/config.toml`, and the Claude Desktop config, all 0600.
+
+### Recommended (user action)
+
+- In Canvas → Settings → Approved Integrations, give the token an expiry date
+  and rotate it periodically.
+- Remove the duplicate token from `~/.codex/config.toml`; the server reads
+  `.env`.
+- In Claude Desktop, use "Allow once" for write tools. Canvas content written
+  by others (posts, announcements) could try to steer the model.
+
 ## 2026-10-23 (night) — Lean mode, trimmed definitions, connection reuse
 
 ### Changed

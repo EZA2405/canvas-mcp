@@ -1608,13 +1608,36 @@ class GetFileInput(_Base):
 
 DOWNLOAD_DIR = Path(os.environ.get("CANVAS_DOWNLOAD_DIR", "~/Downloads/Canvas")).expanduser()
 
+# Local files the tools may read (uploads, attachments) or write (downloads).
+# Anything else — system folders, SSH keys, this server's own .env token — is
+# refused, so a tricked model or an exposed HTTP endpoint can't touch it.
+FILE_ROOTS = [Path(r).expanduser().resolve() for r in
+              os.environ.get("CANVAS_FILE_ROOTS", "~/Downloads:~/Desktop:~/Documents")
+              .split(os.pathsep) if r.strip()]
+_SERVER_DIR = Path(__file__).resolve().parent
+
+
+def _safe_path(raw: Any) -> Path:
+    """Resolve a local path (following symlinks) and refuse it unless it sits
+    inside FILE_ROOTS, outside this server's folder, with no hidden component."""
+    p = Path(str(raw)).expanduser().resolve()
+    root = next((r for r in FILE_ROOTS if p.is_relative_to(r)), None)
+    if root is None:
+        raise CanvasError(f"{p} is outside the folders this server may use: "
+                          + ", ".join(map(str, FILE_ROOTS)))
+    if p.is_relative_to(_SERVER_DIR) or any(
+            part.startswith(".") for part in p.relative_to(root).parts):
+        raise CanvasError(f"{p} is a hidden or protected path; refusing to use it.")
+    return p
+
 
 class DownloadFileInput(_Base):
     file_id: int = Field(..., description="Canvas file ID (from canvas_list_files, "
                                           "modules, or an assignment).", ge=1)
     dest_dir: Optional[str] = Field(
         default=None,
-        description=f"Folder to save into. Defaults to {DOWNLOAD_DIR}. Created if missing.")
+        description=f"Folder to save into (inside Downloads, Desktop, or Documents). "
+                    f"Defaults to {DOWNLOAD_DIR}. Created if missing.")
 
 
 class ListDiscussionsInput(_Base):
@@ -1750,8 +1773,8 @@ class SubmitAssignmentInput(_Base):
                     "online_upload, prefer local_paths.")
     local_paths: Optional[list[str]] = Field(
         default=None,
-        description="For online_upload: absolute paths of files on this computer. "
-                    "They are uploaded to the assignment and submitted on confirm.")
+        description="For online_upload: absolute paths of files in Downloads, Desktop, "
+                    "or Documents. Uploaded to the assignment and submitted on confirm.")
     confirm: bool = _CONFIRM
 
 
@@ -1782,7 +1805,7 @@ class UploadFileInput(_Base):
     course_id: CourseRef = Field(..., description="Canvas course ID to upload into.")
     local_path: str = Field(
         ..., min_length=1,
-        description="Absolute path to the local file to upload.")
+        description="Absolute path to the file (in Downloads, Desktop, or Documents).")
     display_name: Optional[str] = Field(
         default=None,
         description="Name to show in Canvas. Defaults to the file's own filename.")
@@ -1814,9 +1837,8 @@ class SendMessageInput(_Base):
                     "so the message is associated with that course.")
     local_paths: Optional[list[str]] = Field(
         default=None,
-        description="Absolute paths to local files to attach. Each file is "
-                    "uploaded to your Canvas personal files then attached to the "
-                    "message automatically.")
+        description="Absolute paths of files to attach (in Downloads, Desktop, or "
+                    "Documents). Uploaded to your Canvas files, then attached.")
     attachment_ids: Optional[list[int]] = Field(
         default=None,
         description="Canvas file IDs of already-uploaded files to attach. "
@@ -2069,7 +2091,7 @@ async def canvas_download_file(params: DownloadFileInput) -> str:
         if not url:
             return ("Error: Canvas gave no download link for this file — it may be "
                     "locked or not yet published to students.")
-        folder = Path(params.dest_dir).expanduser() if params.dest_dir else DOWNLOAD_DIR
+        folder = _safe_path(params.dest_dir or DOWNLOAD_DIR)
         folder.mkdir(parents=True, exist_ok=True)
         dest = _free_path(folder, f.get("display_name") or f.get("filename") or "download")
         part = dest.with_name(dest.name + ".part")
@@ -2541,7 +2563,7 @@ async def canvas_submit_assignment(params: SubmitAssignmentInput) -> str:
             need = "local_paths" if need == "file_ids" else need
             return (f"Error: submission_type '{params.submission_type}' requires "
                     f"the '{need}' field, which is missing.")
-        local_files = [Path(lp).expanduser() for lp in params.local_paths or []]
+        local_files = [_safe_path(lp) for lp in params.local_paths or []]
         for lf in local_files:
             if not lf.is_file():
                 return f"Error: Local file not found: {lf}"
@@ -2706,7 +2728,7 @@ async def _upload_file(path: str, local_path: str,
                        display_name: Optional[str],
                        folder_path: Optional[str]) -> dict[str, Any]:
     """Execute Canvas's 3-step file upload and return the resulting file object."""
-    p = Path(local_path)
+    p = _safe_path(local_path)
     if not p.exists():
         raise CanvasError(f"Local file not found: {local_path}")
     if not p.is_file():
@@ -2795,7 +2817,7 @@ async def canvas_upload_file(params: UploadFileInput) -> str:
         str: Dry-run preview, or confirmation with the Canvas file_id.
     """
     try:
-        p = Path(params.local_path)
+        p = _safe_path(params.local_path)
         name = params.display_name or p.name
         mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
 
@@ -2957,7 +2979,7 @@ async def canvas_send_message(params: SendMessageInput) -> str:
             ctx = f"course {params.course_id}" if params.course_id else "no course context"
             attach_lines: list[str] = []
             for lp in params.local_paths or []:
-                p = Path(lp)
+                p = _safe_path(lp)
                 if not p.exists():
                     attach_lines.append(f"  • {lp} ⚠️ FILE NOT FOUND")
                 else:
