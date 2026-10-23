@@ -1,5 +1,34 @@
 # STATE
 
+## 2026-10-23 (night) — Lean mode, trimmed definitions, connection reuse
+
+### Changed
+
+- `CANVAS_TOOLSET=lean` registers only `canvas_run_code` and the
+  non-read-only tools except `canvas_run_code_write`. `_tool()` now keeps its
+  own `_TOOLS` registry (name -> wrapper, read_only), so `canvas.tool()`
+  reaches every read tool in either mode. This also removed the dependency on
+  FastMCP's private `_tool_manager`.
+- Tool descriptions sent to the model drop docstring `Args:`/`Returns:`
+  sections (`_model_description`), and schemas drop auto-generated titles
+  (`_drop_titles`). The `canvas_run_code` description was rewritten compactly
+  and now lists the read tools scripts can call.
+- `_get`, `_paginated_get`, and `_send` share one keep-alive httpx client per
+  event loop (`_api_client`). Download and upload clients are unchanged.
+- Claude Desktop config: added `CANVAS_TOOLSET=lean` to the canvas env block.
+  Claude Code still uses full.
+
+### Verified
+
+- Tool-definition tokens: before 14,955 (37 tools); full now 11,475; lean
+  3,727 (9 tools).
+- Over MCP: 8 sequential tool calls took 2.73 s before and 1.66 s now. The
+  13-course Code Mode sweep took 1.36 s before and 1.06 s now.
+- Lean, live: hidden read tools ran from a script with name resolution, and a
+  write tool's dry run worked with `course_id: "THEO 13"`.
+- 18 tests pass (`tests.test_toolset` is new: lean tool set, trimmed
+  descriptions, script access to hidden read tools).
+
 ## 2026-10-23 (evening) — Downloads, file submission, speed
 
 ### Changed
@@ -22,6 +51,12 @@
 - Downloaded "ITENT Capstone Syllabus.pdf" (238 KB, 8 pages) in 2.9 s;
   `file` confirms a valid PDF. The September inst-fs HTTP 406 did not recur.
 - `canvas_get_file` PDF text is readable now.
+- Over MCP stdio: `canvas_download_file` saved the ITENT 122 syllabus (228 KB,
+  7 pages) in 3.9 s. With the user's approval, `canvas_send_message`
+  (`course_id: "ITENT 122"`, `local_paths`) sent it to Alcedrei Bangcola
+  (user 59867) as conversation 1755365. Reading the conversation back
+  confirmed the course context, the body, and the 228 KB attachment, so the
+  upload-and-attach path works live.
 - Speed over MCP: a cross-course upcoming-assignment sweep took 14 classic
   calls and 5.6 s of server time (40 s in a run with one timeout), about
   645 tokens of results. Code Mode took 1 call, 1.4 s, about 170 tokens.

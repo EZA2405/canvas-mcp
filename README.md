@@ -77,6 +77,16 @@ answer — faster, and it keeps large raw data out of Claude's context.
   the script passes `confirm: true`. Nothing can delete.
 - Limits per script: 120 seconds, 300 Canvas calls, 30,000 characters of output.
 
+## Lean mode (`CANVAS_TOOLSET=lean`)
+
+Set `CANVAS_TOOLSET=lean` in a client's env block to expose only 9 tools:
+read-only `canvas_run_code` plus the individual write tools (download, planner
+note, submit, post, reply, comment, upload, message). Every other read tool stays
+reachable from scripts via `canvas.tool(...)`. Tool definitions drop from about
+15,000 to about 3,700 tokens per chat, and no script ever needs write approval.
+Claude Desktop uses lean mode. Claude Code keeps the full set (the default),
+because it already loads tool definitions on demand.
+
 ## Course names instead of IDs
 
 Every `course_id` (and `course_ids` / `exclude_course_ids`) accepts a numeric

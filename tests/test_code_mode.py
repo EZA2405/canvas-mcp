@@ -27,7 +27,7 @@ class CodeModeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_write_tools_not_callable(self):
         out = await self.run_code('return await canvas.tool("canvas_submit_assignment", {});')
-        self.assertIn("use canvas_run_code_write", out)
+        self.assertIn("call it as its own tool", out)
 
     async def test_write_mode_calls_write_tools_unconfirmed_as_preview(self):
         out = await canvas.canvas_run_code_write(canvas.RunCodeInput(code=(

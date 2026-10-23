@@ -30,6 +30,8 @@ import re
 import argparse
 import asyncio
 import functools
+import inspect
+import weakref
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -192,13 +194,27 @@ def _handle_api_error(e: Exception) -> str:
     return f"Error: Unexpected {type(e).__name__}: {e}"
 
 
+_api_clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient]" = \
+    weakref.WeakKeyDictionary()
+
+
+def _api_client() -> httpx.AsyncClient:
+    """Shared keep-alive client for Canvas API calls (one per event loop), so
+    requests reuse the TLS connection instead of opening a new one each time —
+    about 40% faster per request. Download/upload clients stay separate."""
+    loop = asyncio.get_running_loop()
+    client = _api_clients.get(loop)
+    if client is None or client.is_closed:
+        client = _api_clients[loop] = _canvas_client(timeout=REQUEST_TIMEOUT)
+    return client
+
+
 async def _get(path: str, params: Optional[dict[str, Any]] = None) -> Any:
     """Single GET request returning parsed JSON. `path` is relative to API_BASE."""
     url = path if path.startswith("http") else f"{API_BASE}{path}"
-    async with _canvas_client(timeout=REQUEST_TIMEOUT) as client:
-        resp = await client.get(url, headers=_headers(), params=params)
-        resp.raise_for_status()
-        return resp.json()
+    resp = await _api_client().get(url, headers=_headers(), params=params)
+    resp.raise_for_status()
+    return resp.json()
 
 
 async def _paginated_get(path: str, params: Optional[dict[str, Any]] = None,
@@ -209,18 +225,18 @@ async def _paginated_get(path: str, params: Optional[dict[str, Any]] = None,
     url: Optional[str] = f"{API_BASE}{path}"
     out: list[Any] = []
     pages = 0
-    async with _canvas_client(timeout=REQUEST_TIMEOUT) as client:
-        while url and pages < MAX_PAGES and len(out) < max_items:
-            resp = await client.get(url, headers=_headers(),
-                                    params=params if pages == 0 else None)
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, list):
-                out.extend(data)
-            else:
-                return data  # non-list payload; return as-is
-            url = _next_link(resp.headers.get("link", ""))
-            pages += 1
+    client = _api_client()
+    while url and pages < MAX_PAGES and len(out) < max_items:
+        resp = await client.get(url, headers=_headers(),
+                                params=params if pages == 0 else None)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            out.extend(data)
+        else:
+            return data  # non-list payload; return as-is
+        url = _next_link(resp.headers.get("link", ""))
+        pages += 1
     return out[:max_items]
 
 
@@ -499,6 +515,21 @@ async def _resolve_course_fields(params: BaseModel) -> None:
             setattr(params, field, await _resolve_course(value))
 
 
+# CANVAS_TOOLSET=lean exposes only canvas_run_code (read-only) plus the
+# individual write tools, cutting the tool definitions every chat loads from
+# ~15k to ~3k tokens. Scripts can still call every read tool via canvas.tool().
+CANVAS_TOOLSET = os.environ.get("CANVAS_TOOLSET", "full").strip().lower()
+
+# Every tool, exposed over MCP or not: name -> (wrapper, read_only).
+_TOOLS: dict[str, tuple[Any, bool]] = {}
+
+
+def _model_description(doc: Optional[str]) -> str:
+    """Docstring minus its Args:/Returns: sections — the input schema already
+    describes each parameter, so repeating them only costs the model tokens."""
+    return re.split(r"\n\s*(?:Args|Returns):\s*\n", inspect.cleandoc(doc or ""))[0].strip()
+
+
 def _tool(**kwargs: Any):
     """mcp.tool, plus course-name resolution before the tool body runs."""
     def register(fn):
@@ -509,7 +540,13 @@ def _tool(**kwargs: Any):
             except Exception as e:  # noqa: BLE001
                 return _handle_api_error(e)
             return await fn(params)
-        return mcp.tool(**kwargs)(wrapper)
+        name = kwargs["name"]
+        read_only = bool(kwargs.get("annotations", {}).get("readOnlyHint"))
+        _TOOLS[name] = (wrapper, read_only)
+        lean_keep = name == "canvas_run_code" or not (read_only or name == "canvas_run_code_write")
+        if CANVAS_TOOLSET != "lean" or lean_keep:
+            mcp.tool(description=_model_description(fn.__doc__), **kwargs)(wrapper)
+        return wrapper
     return register
 
 
@@ -517,9 +554,17 @@ def _tool(**kwargs: Any):
 # Input models
 # --------------------------------------------------------------------------- #
 
+def _drop_titles(schema: dict[str, Any]) -> None:
+    """Auto-generated titles ("Course Id") just repeat field names; the model
+    pays tokens for every one on every chat."""
+    schema.pop("title", None)
+    for prop in schema.get("properties", {}).values():
+        prop.pop("title", None)
+
+
 class _Base(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True,
-                              extra="forbid")
+                              extra="forbid", json_schema_extra=_drop_titles)
 
 
 class ProfileInput(_Base):
@@ -1384,15 +1429,14 @@ async def _send(method: str, path: str,
     directly in ``data``; list values are encoded as repeated keys by httpx.
     """
     url = path if path.startswith("http") else f"{API_BASE}{path}"
-    async with _canvas_client(timeout=REQUEST_TIMEOUT) as client:
-        resp = await client.request(method, url, headers=_headers(), data=data)
-        resp.raise_for_status()
-        if resp.text.strip():
-            try:
-                return resp.json()
-            except ValueError:
-                return {"raw": resp.text}
-        return {}
+    resp = await _api_client().request(method, url, headers=_headers(), data=data)
+    resp.raise_for_status()
+    if resp.text.strip():
+        try:
+            return resp.json()
+        except ValueError:
+            return {"raw": resp.text}
+    return {}
 
 
 async def _fetch_text(url: str, limit: int = HTML_TEXT_LIMIT) -> Optional[str]:
@@ -3391,14 +3435,13 @@ async def _code_file_text(file_id: Any, limit: Any) -> Optional[str]:
 async def _code_tool(name: Any, args: Any, allow_writes: bool) -> str:
     """Run one of this server's tools from inside a script. Write tools only
     when the script came through canvas_run_code_write."""
-    # shortcut: uses FastMCP's private _tool_manager; revisit if an mcp upgrade breaks it.
-    tool = mcp._tool_manager.get_tool(str(name))
-    hints = getattr(tool, "annotations", None)
-    if tool is None or str(name).startswith("canvas_run_code"):
+    fn, read_only = _TOOLS.get(str(name), (None, False))
+    if fn is None or str(name).startswith("canvas_run_code"):
         raise CanvasError(f"{name!r} is not a Canvas tool callable from a script")
-    if not allow_writes and not getattr(hints, "readOnlyHint", False):
-        raise CanvasError(f"{name!r} writes to Canvas; use canvas_run_code_write")
-    return await tool.run({"params": args or {}}, convert_result=False)
+    if not allow_writes and not read_only:
+        raise CanvasError(f"{name!r} writes to Canvas; call it as its own tool instead")
+    model = inspect.signature(fn).parameters["params"].annotation
+    return await fn(model(**(args or {})))
 
 
 async def _code_dispatch(method: str, args: list[Any], allow_writes: bool) -> Any:
@@ -3502,60 +3545,47 @@ class RunCodeInput(_Base):
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 )
 async def canvas_run_code(params: RunCodeInput) -> str:
-    """Run a JavaScript snippet against a read-only Canvas API — "Code Mode".
+    """Code Mode: run JavaScript against a read-only Canvas API. Prefer it for
+    anything needing several calls, several courses, or filtering/sorting —
+    only what you console.log or return comes back.
 
-    Prefer this over chaining several tools whenever an answer needs more than
-    one or two Canvas calls, spans several courses, or needs filtering, joining,
-    counting, or sorting. The script runs server-side; only what you console.log
-    or return comes back, so large intermediate data never fills your context.
-
-    `code` is the BODY of an async function (top-level await and `return` work).
-    Plain JavaScript only — no TypeScript annotations, no imports. Sandboxed:
-    no network, files, or env; the only way out is the `canvas` object:
+    `code` is an async function body (await and `return` work). Plain JS, no
+    imports; sandboxed with no network/files/env. Its only API:
 
     ```ts
     declare const canvas: {
-      tz: string;  // account timezone, e.g. "Asia/Manila"
-      // GET {base}/api/v1{path}. Any Canvas REST GET endpoint; params may use
-      // Canvas array keys, e.g. {"include[]": ["submission"], "bucket": "upcoming"}.
-      get(path: string, params?: object): Promise<any>;
-      // Same, following pagination; returns the concatenated array (cap maxItems, default 500).
-      getAll(path: string, params?: object, maxItems?: number): Promise<any[]>;
-      // Active courses (term + total_scores included). Fields: id, name, course_code, term, enrollments.
-      courses(): Promise<any[]>;
-      // Course ID from an ID, code, or name, e.g. canvas.course("THEO 13"). Throws if ambiguous.
-      course(ref: string | number): Promise<number>;
-      // Text of a Canvas file: PDF text layer or text-like file; null if binary.
-      fileText(fileId: number, limit?: number): Promise<string | null>;
+      tz: string;                                          // e.g. "Asia/Manila"
+      get(path: string, params?: object): Promise<any>;    // GET /api/v1{path}, e.g. {"include[]": ["submission"]}
+      getAll(path: string, params?: object, maxItems?: number): Promise<any[]>;  // follows pagination
+      courses(): Promise<any[]>;                           // active courses: id, name, course_code, term
+      course(ref: string | number): Promise<number>;       // "THEO 13" -> id; throws if ambiguous
+      fileText(fileId: number, limit?: number): Promise<string | null>;  // PDF/text content
       htmlToText(html: string, limit?: number): Promise<string>;
-      // Run any read-only canvas_* tool by name with its usual params; returns its
-      // Markdown. e.g. canvas.tool("canvas_list_upcoming", {days_ahead: 14}) — includes the overdue
-      // and graded-discussion sweeps that raw endpoints miss.
-      tool(name: string, args?: object): Promise<string>;
-      fmt(iso: string | null): string;  // "YYYY-MM-DD HH:MM" in canvas.tz
+      tool(name: string, args?: object): Promise<string>;  // run a read tool below, returns Markdown
+      fmt(iso: string | null): string;                     // "YYYY-MM-DD HH:MM" local
     };
     ```
 
-    Useful endpoints: /users/self, /courses/:id/assignments (include[]=submission),
-    /courses/:id/assignment_groups (include[]=assignments — category weights),
-    /courses/:id/discussion_topics, /courses/:id/discussion_topics/:id/view,
+    Read tools for canvas.tool() (args = their usual params; course_id takes a
+    name): canvas_list_upcoming {days_ahead} (includes overdue + graded
+    discussions), canvas_list_todo, canvas_get_grades {course_id?},
+    canvas_get_assignment {course_id, assignment_id}, canvas_get_submission,
+    canvas_list_announcements, canvas_get_syllabus, canvas_get_discussion
+    {course_id, topic_id, only_mine?}, canvas_list_modules, canvas_get_page,
+    canvas_get_file, canvas_list_people, canvas_list_calendar_events, and the
+    other canvas_list_*/canvas_get_* tools.
+
+    Endpoints: /courses/:id/assignments, /courses/:id/assignment_groups
+    (include[]=assignments), /courses/:id/discussion_topics,
     /announcements?context_codes[]=course_:id, /courses/:id/modules?include[]=items,
-    /courses/:id/pages/:url, /courses/:id/files?search_term=, /courses/:id/quizzes,
-    /users/self/todo, /planner/items?start_date=, /courses/:id/students/submissions.
+    /courses/:id/pages/:url, /courses/:id/quizzes, /planner/items, /conversations.
 
-    Example:
-    ```js
-    const out = [];
-    for (const c of await canvas.courses()) {
-      const as = await canvas.getAll(`/courses/${c.id}/assignments`, {"include[]": ["submission"], bucket: "upcoming"});
-      for (const a of as) if (a.points_possible >= 20) out.push(`${c.course_code}: ${a.name} — ${canvas.fmt(a.due_at)}`);
-    }
-    console.log(out.join("\n") || "none");
-    ```
+    Example: `const id = await canvas.course("THEO 13"); const as = await
+    canvas.getAll(`/courses/${id}/assignments`, {bucket: "upcoming"}); return
+    as.map(a => `${a.name} — ${canvas.fmt(a.due_at)}`);`
 
-    Writes (submit, post, message, upload) are NOT available here — use
-    canvas_run_code_write or the canvas_* write tools. Limits: 120 s, 300
-    Canvas calls, output truncated at 30,000 characters. Failed canvas.* calls throw.
+    No writes here — use the canvas_* write tools. Limits: 120 s, 300 calls,
+    30,000 output chars. Failed canvas.* calls throw.
 
     Returns:
         str: Captured console output, then the returned value as JSON.
