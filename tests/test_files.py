@@ -15,7 +15,11 @@ def mock_canvas(respond):
     def client(**kwargs):
         return original(transport=httpx.MockTransport(respond), **kwargs)
 
-    return patch.multiple(canvas, _canvas_client=client, CANVAS_API_TOKEN="test-token")
+    async def dns_ok():
+        return None
+
+    return patch.multiple(canvas, _canvas_client=client, CANVAS_API_TOKEN="test-token",
+                          _dns_ready=dns_ok)
 
 
 class TempRootsMixin:
@@ -127,6 +131,18 @@ class SafePathTests(unittest.IsolatedAsyncioTestCase):
         for out in (msg, dl, sub):
             self.assertIn("Error:", out)
             self.assertNotIn("DRY RUN", out)
+
+
+class DnsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dns_failure_gives_clear_network_error(self):
+        async def fail(*args, **kwargs):
+            raise OSError("nodename nor servname provided")
+
+        loop = __import__("asyncio").get_running_loop()
+        with patch.object(loop, "getaddrinfo", fail), \
+                patch.object(canvas, "CANVAS_API_TOKEN", "test-token"):
+            out = await canvas.canvas_get_profile(canvas.ProfileInput())
+        self.assertIn("internet or DNS is not answering", out)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,26 @@
 # STATE
 
+## 2026-10-23 11:45 PHT — Claude Desktop timeouts diagnosed
+
+- Claude Desktop's `mcp-server-canvas.log` shows tool calls 17–20
+  (03:37–03:39Z) each returning after exactly 30.0 s, the old
+  `REQUEST_TIMEOUT`. Earlier calls took 0.3–4 s. The server never crashed.
+- Root cause: the Mac's DNS. On Ateneo Wi-Fi (gateway 10.80.203.254, DHCP
+  DNS 10.0.1.1), every DNS query on port 53, UDP and TCP, times out: to
+  10.0.1.1, 1.1.1.1, 8.8.8.8, and the manually set 192.168.1.1 (the home
+  router, unreachable here). HTTPS by IP works, and Cloudflare
+  DNS-over-HTTPS (`https://1.1.1.1/dns-query`) resolves Canvas instantly.
+  This also explains the earlier "Canvas down" periods and other MCP
+  servers timing out at startup.
+- Server change: `_dns_ready()` resolves the Canvas host with a cancellable
+  10 s cap before API calls, and `REQUEST_TIMEOUT` has `connect=10`. Raising
+  `httpx.ConnectTimeout` maps to a clear "internet or DNS is not answering"
+  message. Measured live while DNS was down: 30.1 s before, 10.0 s after.
+  httpx's own resolver thread can't be cancelled, which is why connect=10
+  alone still took 30 s.
+- User fix (system setting, not done by Claude): use encrypted DNS (DoH),
+  for example the Cloudflare 1.1.1.1 app, or switch networks.
+
 ## 2026-10-23 (late) — Security lock-down
 
 ### Changed

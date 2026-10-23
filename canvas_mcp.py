@@ -81,7 +81,9 @@ CANVAS_BASE_URL = os.environ.get("CANVAS_BASE_URL", DEFAULT_BASE_URL).rstrip("/"
 CANVAS_API_TOKEN = os.environ.get("CANVAS_API_TOKEN", "").strip()
 API_BASE = f"{CANVAS_BASE_URL}/api/v1"
 
-REQUEST_TIMEOUT = 30.0
+# Connecting (DNS lookup + TLS) gets 10 s: when the network's DNS is down the
+# lookup just hangs, and failing fast with a clear message beats 30 s of silence.
+REQUEST_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 MAX_PAGES = 20            # safety cap when following pagination links
 DEFAULT_PER_PAGE = 100
 HTML_TEXT_LIMIT = 4000    # truncate long HTML bodies (syllabus, descriptions)
@@ -181,6 +183,10 @@ def _handle_api_error(e: Exception) -> str:
                     "environment this server was launched in, or set "
                     f"CANVAS_TRUST_ENV=0 to bypass it.{detail}")
         return f"Error: Canvas API request failed with HTTP {code}.{detail}"
+    if isinstance(e, httpx.ConnectTimeout):
+        return (f"Error: Could not reach {CANVAS_BASE_URL} within 10 s. This computer's "
+                "internet or DNS is not answering (not a Canvas or server problem); "
+                "retrying will not help until the network recovers.")
     if isinstance(e, httpx.TimeoutException):
         return "Error: Request to Canvas timed out. Check your connection and retry."
     if isinstance(e, httpx.ConnectError):
@@ -209,9 +215,20 @@ def _api_client() -> httpx.AsyncClient:
     return client
 
 
+async def _dns_ready() -> None:
+    """Look up the Canvas host with a 10 s cap. httpx resolves in a thread that
+    can't be cancelled, so a hung DNS server otherwise stalls each call ~30 s."""
+    host = httpx.URL(CANVAS_BASE_URL).host
+    try:
+        await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(host, 443), 10)
+    except (asyncio.TimeoutError, OSError) as e:
+        raise httpx.ConnectTimeout(f"DNS lookup for {host} failed: {e!r}") from None
+
+
 async def _get(path: str, params: Optional[dict[str, Any]] = None) -> Any:
     """Single GET request returning parsed JSON. `path` is relative to API_BASE."""
     url = path if path.startswith("http") else f"{API_BASE}{path}"
+    await _dns_ready()
     resp = await _api_client().get(url, headers=_headers(), params=params)
     resp.raise_for_status()
     return resp.json()
@@ -225,6 +242,7 @@ async def _paginated_get(path: str, params: Optional[dict[str, Any]] = None,
     url: Optional[str] = f"{API_BASE}{path}"
     out: list[Any] = []
     pages = 0
+    await _dns_ready()
     client = _api_client()
     while url and pages < MAX_PAGES and len(out) < max_items:
         resp = await client.get(url, headers=_headers(),
@@ -1429,6 +1447,7 @@ async def _send(method: str, path: str,
     directly in ``data``; list values are encoded as repeated keys by httpx.
     """
     url = path if path.startswith("http") else f"{API_BASE}{path}"
+    await _dns_ready()
     resp = await _api_client().request(method, url, headers=_headers(), data=data)
     resp.raise_for_status()
     if resp.text.strip():
