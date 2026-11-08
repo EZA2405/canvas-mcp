@@ -3683,7 +3683,7 @@ async def _code_output(code: str, allow_writes: bool) -> str:
 # Entry point
 # --------------------------------------------------------------------------- #
 
-if __name__ == "__main__":
+def main() -> None:
     parser = argparse.ArgumentParser(description="Canvas LMS MCP server")
     parser.add_argument(
         "--transport",
@@ -3725,3 +3725,7 @@ if __name__ == "__main__":
             )
 
     mcp.run(transport=args.transport)
+
+
+if __name__ == "__main__":
+    main()

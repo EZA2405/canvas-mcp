@@ -123,32 +123,61 @@ to the assignment only on the `confirm=true` call; `file_ids` also accepted).
 
 ## Setup
 
-### 1. Install dependencies (one time)
+### 1. Get the tools and a Canvas token
+
+- Install [uv](https://docs.astral.sh/uv/) (it installs Python for you):
+  `curl -LsSf https://astral.sh/uv/install.sh | sh`
+  (Windows: `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"`).
+- Optional, for Code Mode: `brew install deno`.
+- In Canvas: **Account → Settings → Approved Integrations → + New Access Token**.
+  Copy the token. Never paste it into a chat.
+
+### 2. Add the server to your MCP client
+
+**Claude Desktop** — open the config file:
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+
+Add this (merge into `mcpServers` if the file already has servers):
+
+```json
+{
+  "mcpServers": {
+    "canvas": {
+      "command": "/Users/YOU/.local/bin/uvx",
+      "args": ["--from", "git+https://github.com/EZA2405/canvas-mcp", "canvas-mcp"],
+      "env": {
+        "CANVAS_API_TOKEN": "PASTE_YOUR_TOKEN_HERE",
+        "CANVAS_BASE_URL": "https://ateneo.instructure.com"
+      }
+    }
+  }
+}
+```
+
+- Replace `/Users/YOU/.local/bin/uvx` with the output of `which uvx`
+  (Windows: `where uvx`). Claude Desktop does not see your shell `PATH`.
+- Change `CANVAS_BASE_URL` if your school uses another Canvas instance.
+
+**Claude Code:**
 
 ```bash
-cd canvas-mcp
+claude mcp add canvas -s user -e CANVAS_API_TOKEN=PASTE_YOUR_TOKEN_HERE -- uvx --from git+https://github.com/EZA2405/canvas-mcp canvas-mcp
+```
+
+**Update to the latest version:** `uv cache clean canvas-mcp`, then restart the client.
+
+### Developing locally
+
+```bash
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 ```
 
-(No new dependencies were added — still just `mcp` and `httpx`.)
+Point your client at `./venv/bin/python /ABSOLUTE/PATH/canvas_mcp.py` instead
+(see `claude_desktop_config.example.json`).
 
-### 2. Register it with Claude Desktop
-
-> Local stdio MCP servers run through the **Claude Desktop app**, not the
-> claude.ai website. If you're using the web app, install Claude Desktop first.
-
-Open the config file:
-- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
-
-Merge in the block from `claude_desktop_config.example.json`, replacing:
-- `/ABSOLUTE/PATH/TO/canvas-mcp/` with the real absolute path on your machine
-- `PASTE_YOUR_FRESH_TOKEN_HERE` with the new token from the rotation step
-
-Use absolute paths and the venv's Python so dependencies resolve.
-
-### 3. Restart Claude Desktop
+### 3. Restart your client
 
 Try: *"Use Canvas to read the DECSC 25 syllabus page,"* then *"What's on my
 calendar this week?"*
@@ -158,7 +187,7 @@ calendar this week?"*
 ```bash
 CANVAS_API_TOKEN="your_new_token" \
 CANVAS_BASE_URL="https://ateneo.instructure.com" \
-npx @modelcontextprotocol/inspector ./venv/bin/python canvas_mcp.py
+npx @modelcontextprotocol/inspector uvx --from git+https://github.com/EZA2405/canvas-mcp canvas-mcp
 ```
 
 In the Inspector, call a write tool **without** `confirm` first and read the
