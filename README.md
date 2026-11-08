@@ -90,9 +90,9 @@ answer — faster, and it keeps large raw data out of Claude's context.
 
 ## Lean mode (`CANVAS_TOOLSET=lean`)
 
-`CANVAS_TOOLSET=lean` is set in `.env`, so every client gets it unless its
-own env block overrides it (Claude Desktop rewrites its config file and drops
-added keys, so it can't be set there). It exposes only 9 tools:
+Pass `--lean` (as in Setup), or set `CANVAS_TOOLSET=lean` in the env block or
+in a `.env` file next to `canvas_mcp.py`. Claude Desktop can drop custom env
+keys when it rewrites its config, so prefer `--lean` there. It exposes only 9 tools:
 read-only `canvas_run_code` plus the individual write tools (download, planner
 note, submit, post, reply, comment, upload, message). Every other read tool stays
 reachable from scripts via `canvas.tool(...)`. Tool definitions drop from about
@@ -128,7 +128,8 @@ to the assignment only on the `confirm=true` call; `file_ids` also accepted).
 - Install [uv](https://docs.astral.sh/uv/) (it installs Python for you):
   `curl -LsSf https://astral.sh/uv/install.sh | sh`
   (Windows: `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"`).
-- Optional, for Code Mode: `brew install deno`.
+- Install [Deno](https://deno.com) for Code Mode: `brew install deno`
+  (Windows: `winget install DenoLand.Deno`). Lean mode needs it.
 - In Canvas: **Account → Settings → Approved Integrations → + New Access Token**.
   Copy the token. Never paste it into a chat.
 
@@ -145,7 +146,7 @@ Add this (merge into `mcpServers` if the file already has servers):
   "mcpServers": {
     "canvas": {
       "command": "/Users/YOU/.local/bin/uvx",
-      "args": ["--from", "git+https://github.com/EZA2405/canvas-mcp", "canvas-mcp"],
+      "args": ["--from", "git+https://github.com/EZA2405/canvas-mcp", "canvas-mcp", "--lean"],
       "env": {
         "CANVAS_API_TOKEN": "PASTE_YOUR_TOKEN_HERE",
         "CANVAS_BASE_URL": "https://ateneo.instructure.com"
@@ -158,11 +159,12 @@ Add this (merge into `mcpServers` if the file already has servers):
 - Replace `/Users/YOU/.local/bin/uvx` with the output of `which uvx`
   (Windows: `where uvx`). Claude Desktop does not see your shell `PATH`.
 - Change `CANVAS_BASE_URL` if your school uses another Canvas instance.
+- `--lean` gives 9 tools (see Lean mode). Remove it for all 37.
 
 **Claude Code:**
 
 ```bash
-claude mcp add canvas -s user -e CANVAS_API_TOKEN=PASTE_YOUR_TOKEN_HERE -- uvx --from git+https://github.com/EZA2405/canvas-mcp canvas-mcp
+claude mcp add canvas -s user -e CANVAS_API_TOKEN=PASTE_YOUR_TOKEN_HERE -- uvx --from git+https://github.com/EZA2405/canvas-mcp canvas-mcp --lean
 ```
 
 **Update to the latest version:** `uv cache clean canvas-mcp`, then restart the client.

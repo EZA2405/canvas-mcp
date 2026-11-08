@@ -27,6 +27,7 @@ import json
 import mimetypes
 import os
 import re
+import sys
 import argparse
 import asyncio
 import functools
@@ -536,7 +537,8 @@ async def _resolve_course_fields(params: BaseModel) -> None:
 # CANVAS_TOOLSET=lean exposes only canvas_run_code (read-only) plus the
 # individual write tools, cutting the tool definitions every chat loads from
 # ~15k to ~3k tokens. Scripts can still call every read tool via canvas.tool().
-CANVAS_TOOLSET = os.environ.get("CANVAS_TOOLSET", "full").strip().lower()
+# The --lean flag does the same, for clients that drop custom env keys.
+CANVAS_TOOLSET = "lean" if "--lean" in sys.argv else os.environ.get("CANVAS_TOOLSET", "full").strip().lower()
 
 # Every tool, exposed over MCP or not: name -> (wrapper, read_only).
 _TOOLS: dict[str, tuple[Any, bool]] = {}
@@ -3713,6 +3715,7 @@ def main() -> None:
         default=os.environ.get("MCP_DEV_ALLOW_TUNNEL_HOSTS", "").lower() in {"1", "true", "yes"},
         help="Disable DNS rebinding protection for local development through HTTPS tunnels.",
     )
+    parser.add_argument("--lean", action="store_true", help="Same as CANVAS_TOOLSET=lean.")
     args = parser.parse_args()
 
     if args.transport == "streamable-http":
