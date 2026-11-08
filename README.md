@@ -99,6 +99,27 @@ reachable from scripts via `canvas.tool(...)`. Tool definitions drop from about
 15,000 to about 3,700 tokens per chat, and no script ever needs write approval.
 To give one client the full set, add `CANVAS_TOOLSET=full` to its env block.
 
+### Lean or full: which to choose
+
+| | Lean (`--lean`, 9 tools) | Full (default, 37 tools) |
+|---|---|---|
+| Tokens per chat for tool definitions | About 3,700 | About 15,000 |
+| Needs Deno installed | **Yes**. Without it, nothing can be read | No (only `canvas_run_code` needs it) |
+| How Claude reads Canvas | Writes one short script that makes many calls | Calls one tool per question |
+| Multi-step questions ("all unsubmitted work over 20 points, every course") | Fast: one script, only the answer comes back | Slow: many tool calls, raw data fills the chat |
+| Simple questions ("my grade in THEO 13") | Still writes a small script | One direct tool call |
+| What you see while it works | A script; harder to follow | Named tool calls; easy to follow |
+| Works with weaker or smaller models | Less well: the model must write correct JavaScript | Better: the model only picks a tool |
+| Writes (submit, post, reply, comment, note) | Same individual, confirm-gated tools | Same |
+
+**Choose lean if** you use Claude (or another strong model), you can run
+`brew install deno`, and you want longer chats before hitting usage limits.
+This is the recommended setup.
+
+**Choose full if** you can't install Deno, you use a smaller model that
+writes code poorly, or you want to see each Canvas call by name. To switch,
+remove `--lean` from `args` and restart your client.
+
 ## Course names instead of IDs
 
 Every `course_id` (and `course_ids` / `exclude_course_ids`) accepts a numeric
