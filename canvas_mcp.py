@@ -27,7 +27,6 @@ import json
 import mimetypes
 import os
 import re
-import sys
 import argparse
 import asyncio
 import functools
@@ -80,6 +79,7 @@ _load_dotenv()
 DEFAULT_BASE_URL = "https://ateneo.instructure.com"
 CANVAS_BASE_URL = os.environ.get("CANVAS_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
 CANVAS_API_TOKEN = os.environ.get("CANVAS_API_TOKEN", "").strip()
+CANVAS_TOKEN_FILE = os.environ.get("CANVAS_TOKEN_FILE", "").strip()
 API_BASE = f"{CANVAS_BASE_URL}/api/v1"
 
 # Connecting (DNS lookup + TLS) gets 10 s: when the network's DNS is down the
@@ -143,13 +143,31 @@ def _canvas_client(**kwargs: Any) -> httpx.AsyncClient:
     return httpx.AsyncClient(**kwargs)
 
 
-def _headers() -> dict[str, str]:
-    if not CANVAS_API_TOKEN:
+def _headers(url: Optional[str] = None) -> dict[str, str]:
+    token = CANVAS_API_TOKEN
+    if CANVAS_TOKEN_FILE:
+        try:
+            from canvas_token_rotation import canvas_origin, read_state
+
+            state = read_state(Path(CANVAS_TOKEN_FILE).expanduser())
+            origin = canvas_origin(CANVAS_BASE_URL)
+            if canvas_origin(state["base_url"]) != origin:
+                raise ValueError
+            if url is not None:
+                target = httpx.URL(url).copy_with(path="/", query=None, fragment=None)
+                if canvas_origin(str(target)) != origin:
+                    raise CanvasError("Refusing to send the Canvas token to another origin.")
+            token = state["token"]
+            if not isinstance(token, str) or not token:
+                raise ValueError
+        except (OSError, KeyError, TypeError, ValueError):
+            raise CanvasError("Could not read the Canvas token file.") from None
+    if not token:
         raise CanvasError(
             "CANVAS_API_TOKEN is not set. Add your Canvas personal access token "
             "as the CANVAS_API_TOKEN environment variable in your MCP server config."
         )
-    return {"Authorization": f"Bearer {CANVAS_API_TOKEN}"}
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _handle_api_error(e: Exception) -> str:
@@ -230,7 +248,7 @@ async def _get(path: str, params: Optional[dict[str, Any]] = None) -> Any:
     """Single GET request returning parsed JSON. `path` is relative to API_BASE."""
     url = path if path.startswith("http") else f"{API_BASE}{path}"
     await _dns_ready()
-    resp = await _api_client().get(url, headers=_headers(), params=params)
+    resp = await _api_client().get(url, headers=_headers(url), params=params)
     resp.raise_for_status()
     return resp.json()
 
@@ -246,7 +264,7 @@ async def _paginated_get(path: str, params: Optional[dict[str, Any]] = None,
     await _dns_ready()
     client = _api_client()
     while url and pages < MAX_PAGES and len(out) < max_items:
-        resp = await client.get(url, headers=_headers(),
+        resp = await client.get(url, headers=_headers(url),
                                 params=params if pages == 0 else None)
         resp.raise_for_status()
         data = resp.json()
@@ -534,12 +552,6 @@ async def _resolve_course_fields(params: BaseModel) -> None:
             setattr(params, field, await _resolve_course(value))
 
 
-# CANVAS_TOOLSET=lean exposes only canvas_run_code (read-only) plus the
-# individual write tools, cutting the tool definitions every chat loads from
-# ~15k to ~3k tokens. Scripts can still call every read tool via canvas.tool().
-# The --lean flag does the same, for clients that drop custom env keys.
-CANVAS_TOOLSET = "lean" if "--lean" in sys.argv else os.environ.get("CANVAS_TOOLSET", "full").strip().lower()
-
 # Every tool, exposed over MCP or not: name -> (wrapper, read_only).
 _TOOLS: dict[str, tuple[Any, bool]] = {}
 
@@ -563,8 +575,7 @@ def _tool(**kwargs: Any):
         name = kwargs["name"]
         read_only = bool(kwargs.get("annotations", {}).get("readOnlyHint"))
         _TOOLS[name] = (wrapper, read_only)
-        lean_keep = name == "canvas_run_code" or not (read_only or name == "canvas_run_code_write")
-        if CANVAS_TOOLSET != "lean" or lean_keep:
+        if name == "canvas_run_code" or not read_only:
             mcp.tool(description=_model_description(fn.__doc__), **kwargs)(wrapper)
         return wrapper
     return register
@@ -1450,7 +1461,7 @@ async def _send(method: str, path: str,
     """
     url = path if path.startswith("http") else f"{API_BASE}{path}"
     await _dns_ready()
-    resp = await _api_client().request(method, url, headers=_headers(), data=data)
+    resp = await _api_client().request(method, url, headers=_headers(url), data=data)
     resp.raise_for_status()
     if resp.text.strip():
         try:
@@ -1642,6 +1653,13 @@ def _safe_path(raw: Any) -> Path:
     """Resolve a local path (following symlinks) and refuse it unless it sits
     inside FILE_ROOTS, outside this server's folder, with no hidden component."""
     p = Path(str(raw)).expanduser().resolve()
+    if CANVAS_TOKEN_FILE:
+        token_path = Path(CANVAS_TOKEN_FILE).expanduser().resolve()
+        try:
+            if p == token_path or p.samefile(token_path):
+                raise CanvasError("The Canvas token file is protected.")
+        except OSError:
+            pass
     root = next((r for r in FILE_ROOTS if p.is_relative_to(r)), None)
     if root is None:
         raise CanvasError(f"{p} is outside the folders this server may use: "
@@ -1653,7 +1671,7 @@ def _safe_path(raw: Any) -> Path:
 
 
 class DownloadFileInput(_Base):
-    file_id: int = Field(..., description="Canvas file ID (from canvas_list_files, "
+    file_id: int = Field(..., description="Canvas file ID (from canvas.tool('canvas_list_files', ...), "
                                           "modules, or an assignment).", ge=1)
     dest_dir: Optional[str] = Field(
         default=None,
@@ -1848,7 +1866,7 @@ class SendMessageInput(_Base):
     recipient_ids: list[str] = Field(
         ..., min_length=1,
         description="List of Canvas user IDs or login IDs to send to. "
-                    "Use canvas_get_profile to find your own ID; instructor IDs "
+                    "Use canvas.tool('canvas_get_profile') to find your own ID; instructor IDs "
                     "appear in announcement/discussion author data.")
     subject: str = Field(..., min_length=1, description="Message subject line.")
     body: str = Field(..., min_length=1, description="Message body text.")
@@ -2097,7 +2115,7 @@ async def canvas_download_file(params: DownloadFileInput) -> str:
 
     Saves into ~/Downloads/Canvas by default (or dest_dir). Never overwrites: a
     name clash gets a " (2)" suffix. Changes nothing on Canvas. To read a file's
-    text instead of saving it, use canvas_get_file.
+    text instead of saving it, use Code Mode's canvas.tool("canvas_get_file", ...).
 
     Args:
         params.file_id: Canvas file ID.
@@ -2765,8 +2783,8 @@ async def _upload_file(path: str, local_path: str,
         slot_data["parent_folder_path"] = folder_path
 
     async with _canvas_client(timeout=REQUEST_TIMEOUT) as client:
-        r1 = await client.post(f"{API_BASE}{path}",
-                               headers=_headers(), data=slot_data)
+        slot_url = f"{API_BASE}{path}"
+        r1 = await client.post(slot_url, headers=_headers(slot_url), data=slot_data)
         r1.raise_for_status()
         slot = r1.json()
 
@@ -2787,7 +2805,7 @@ async def _upload_file(path: str, local_path: str,
             # Step 3: S3 path — follow redirect to Canvas confirm URL (needs auth).
             confirm_url = r2.headers["location"]
             async with _canvas_client(timeout=REQUEST_TIMEOUT) as c3:
-                r3 = await c3.get(confirm_url, headers=_headers())
+                r3 = await c3.get(confirm_url, headers=_headers(confirm_url))
                 r3.raise_for_status()
                 return r3.json()
 
@@ -3355,7 +3373,7 @@ class ListToolsInput(_Base):
 )
 async def canvas_list_tools(params: ListToolsInput) -> str:
     """List every tool this Canvas MCP server provides, grouped by category, with
-    a one-line purpose for each. Call this FIRST when exploring what this
+    a one-line purpose for each. Use canvas.tool("canvas_list_tools") to see what this
     connector can do — courses, assignments, grades, announcements, modules,
     pages, files, discussions, quizzes, calendar, to-do, people, and the
     confirm-gated write tools all live here, so one call surfaces the whole
@@ -3367,7 +3385,6 @@ async def canvas_list_tools(params: ListToolsInput) -> str:
     groups = [
         ("Code Mode (best for multi-step or cross-course questions)", [
             ("canvas_run_code", "Run a JavaScript snippet against a read-only Canvas API; only its printed output comes back."),
-            ("canvas_run_code_write", "Same, but the script may also call the write tools (pass confirm: true to act)."),
         ]),
         ("Profile & courses", [
             ("canvas_get_profile", "Verify the token and see whose account is connected."),
@@ -3475,19 +3492,18 @@ async def _code_file_text(file_id: Any, limit: Any) -> Optional[str]:
     return _extract_pdf_text(await _download_bytes(url), limit=int(limit))
 
 
-async def _code_tool(name: Any, args: Any, allow_writes: bool) -> str:
-    """Run one of this server's tools from inside a script. Write tools only
-    when the script came through canvas_run_code_write."""
+async def _code_tool(name: Any, args: Any) -> str:
+    """Run a read tool from inside a script."""
     fn, read_only = _TOOLS.get(str(name), (None, False))
     if fn is None or str(name).startswith("canvas_run_code"):
         raise CanvasError(f"{name!r} is not a Canvas tool callable from a script")
-    if not allow_writes and not read_only:
+    if not read_only:
         raise CanvasError(f"{name!r} writes to Canvas; call it as its own tool instead")
     model = inspect.signature(fn).parameters["params"].annotation
     return await fn(model(**(args or {})))
 
 
-async def _code_dispatch(method: str, args: list[Any], allow_writes: bool) -> Any:
+async def _code_dispatch(method: str, args: list[Any]) -> Any:
     if method == "get":
         return await _get(_api_path(args[0]), args[1])
     if method == "getAll":
@@ -3502,7 +3518,7 @@ async def _code_dispatch(method: str, args: list[Any], allow_writes: bool) -> An
     if method == "course":
         return await _resolve_course(args[0])
     if method == "tool":
-        return await _code_tool(args[0], args[1], allow_writes)
+        return await _code_tool(args[0], args[1])
     raise CanvasError(f"unknown canvas method {method!r}")
 
 
@@ -3510,7 +3526,7 @@ def _rpc_error(e: Exception) -> str:
     return _handle_api_error(e).removeprefix("Error: ")
 
 
-async def _run_sandbox(code: str, allow_writes: bool = False) -> dict[str, Any]:
+async def _run_sandbox(code: str) -> dict[str, Any]:
     """Run `code` in the Deno sandbox, serving its canvas.* calls. Returns the
     runner's final message: {logs, result, error}."""
     deno = _deno_path()
@@ -3537,8 +3553,7 @@ async def _run_sandbox(code: str, allow_writes: bool = False) -> dict[str, Any]:
     async def serve(msg: dict[str, Any]) -> None:
         try:
             async with sem:
-                value = await _code_dispatch(msg.get("m", ""), list(msg.get("a") or []),
-                                             allow_writes)
+                value = await _code_dispatch(msg.get("m", ""), list(msg.get("a") or []))
             reply({"id": msg["id"], "ok": True, "v": value})
         except Exception as e:  # noqa: BLE001
             reply({"id": msg["id"], "ok": False, "e": _rpc_error(e)})
@@ -3633,39 +3648,8 @@ async def canvas_run_code(params: RunCodeInput) -> str:
     Returns:
         str: Captured console output, then the returned value as JSON.
     """
-    return await _code_output(params.code, allow_writes=False)
-
-
-@_tool(
-    name="canvas_run_code_write",
-    annotations={"title": "Run Code Against Canvas (can write)", "readOnlyHint": False,
-                 "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
-)
-async def canvas_run_code_write(params: RunCodeInput) -> str:
-    """Same sandbox and `canvas` API as canvas_run_code, but canvas.tool() may
-    also call the write tools, so one script can read and then act — e.g. find
-    every unanswered graded discussion and post the entries the user approved.
-
-    Write tools available through canvas.tool(name, args): canvas_submit_assignment,
-    canvas_post_discussion_entry, canvas_reply_to_entry,
-    canvas_post_submission_comment, canvas_send_message, canvas_upload_file,
-    canvas_create_planner_note, canvas_download_file (saves to this computer). Args are each tool's usual params. Without
-    `confirm: true` a write tool returns a preview and sends nothing; with it,
-    the write happens. Course args accept codes/names like "THEO 13".
-
-    Use canvas_run_code for anything read-only. Before confirming writes, show
-    the user what will be written unless they already approved those exact
-    actions. Nothing can delete. Same limits as canvas_run_code.
-
-    Returns:
-        str: Captured console output, then the returned value as JSON.
-    """
-    return await _code_output(params.code, allow_writes=True)
-
-
-async def _code_output(code: str, allow_writes: bool) -> str:
     try:
-        res = await _run_sandbox(code, allow_writes)
+        res = await _run_sandbox(params.code)
     except Exception as e:  # noqa: BLE001
         return _handle_api_error(e)
     parts = list(res.get("logs") or [])
@@ -3715,7 +3699,7 @@ def main() -> None:
         default=os.environ.get("MCP_DEV_ALLOW_TUNNEL_HOSTS", "").lower() in {"1", "true", "yes"},
         help="Disable DNS rebinding protection for local development through HTTPS tunnels.",
     )
-    parser.add_argument("--lean", action="store_true", help="Same as CANVAS_TOOLSET=lean.")
+    parser.add_argument("--lean", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.transport == "streamable-http":
