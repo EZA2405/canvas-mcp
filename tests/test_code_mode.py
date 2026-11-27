@@ -29,11 +29,6 @@ class CodeModeTests(unittest.IsolatedAsyncioTestCase):
         out = await self.run_code('return await canvas.tool("canvas_submit_assignment", {});')
         self.assertIn("call it as its own tool", out)
 
-    async def test_write_mode_calls_write_tools_unconfirmed_as_preview(self):
-        out = await canvas.canvas_run_code_write(canvas.RunCodeInput(code=(
-            'return await canvas.tool("canvas_create_planner_note", {title: "x", todo_date: "2026-12-01"});')))
-        self.assertIn("DRY RUN", out)
-
     async def test_course_name_resolution(self):
         courses = [{"id": 70437, "course_code": "THEO 13-L1", "name": "A THEOLOGY OF MARRIAGE"},
                    {"id": 52809, "course_code": "PEPC 11.13-PFT-L1", "name": "DANCE FUNDAMENTALS"},

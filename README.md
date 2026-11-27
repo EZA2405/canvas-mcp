@@ -18,8 +18,8 @@ If you have ever pasted your token into a chat, treat it as compromised:
 
 ## How writes stay safe (read this)
 
-Five tools can change things on your Canvas account. Every one of them is gated
-behind a **`confirm` flag that defaults to `False`**:
+Tools that change your Canvas account have a **`confirm` flag that defaults to
+`False`**:
 
 - Call it normally → it **sends nothing** and returns a *preview* of exactly what
   it would do (which assignment, due date, your current submission state, an
@@ -30,7 +30,7 @@ So a single ambiguous request can never submit homework or post to a class
 discussion under your name by accident. **No tool deletes anything** — deletion
 was deliberately left out.
 
-## Read tools
+## Read functions for `canvas.tool(...)`
 
 | Tool | Purpose |
 |------|---------|
@@ -47,7 +47,6 @@ was deliberately left out.
 | `canvas_get_page` | Read a Page's full body as text |
 | `canvas_list_files` | List course files (name, ID, type, size) |
 | `canvas_get_file` | File metadata; inlines text for text-based files, download URL for binaries |
-| `canvas_download_file` | Save a Canvas file to `~/Downloads/Canvas` (or `CANVAS_DOWNLOAD_DIR` / `dest_dir`); never overwrites |
 | `canvas_list_discussions` | List discussion topics in a course |
 | `canvas_get_discussion` | A topic's prompt + full threaded replies |
 | `canvas_list_quizzes` | List quizzes with due dates, points, question counts |
@@ -70,11 +69,7 @@ answer — faster, and it keeps large raw data out of Claude's context.
 - Its only access is a `canvas` object that this server answers. Requests are
   **GET-only** and limited to the Canvas API, and your token never enters the
   sandbox.
-- `canvas_run_code` is read-only. `canvas_run_code_write` uses the same sandbox
-  but may also call the write tools below from the script (for example, find
-  every unanswered graded discussion, then post). It is marked destructive, so
-  Claude asks your approval before each run. Each write still previews unless
-  the script passes `confirm: true`. Nothing can delete.
+- Use the separate write tools for actions that require confirmation.
 - Limits per script: 120 seconds, 300 Canvas calls, 30,000 characters of output.
 
 ## Local file and network safety
@@ -88,37 +83,14 @@ answer — faster, and it keeps large raw data out of Claude's context.
   other path returns 404. Treat the printed URL like a password.
 - `.runtime/` (tunnel logs, PIDs, the secret) is git-ignored.
 
-## Lean mode (`CANVAS_TOOLSET=lean`)
+## Lean tools
 
-Pass `--lean` (as in Setup), or set `CANVAS_TOOLSET=lean` in the env block or
-in a `.env` file next to `canvas_mcp.py`. Claude Desktop can drop custom env
-keys when it rewrites its config, so prefer `--lean` there. It exposes only 9 tools:
-read-only `canvas_run_code` plus the individual write tools (download, planner
-note, submit, post, reply, comment, upload, message). Every other read tool stays
-reachable from scripts via `canvas.tool(...)`. Tool definitions drop from about
-15,000 to about 3,700 tokens per chat, and no script ever needs write approval.
-To give one client the full set, add `CANVAS_TOOLSET=full` to its env block.
+The server exposes read-only `canvas_run_code` and eight separate tools for
+actions such as downloads, uploads, and submissions. Code Mode can call the
+read functions listed above with `canvas.tool(...)`.
 
-### Lean or full: which to choose
-
-| | Lean (`--lean`, 9 tools) | Full (default, 37 tools) |
-|---|---|---|
-| Tokens per chat for tool definitions | About 3,700 | About 15,000 |
-| Needs Deno installed | **Yes**. Without it, nothing can be read | No (only `canvas_run_code` needs it) |
-| How Claude reads Canvas | Writes one short script that makes many calls | Calls one tool per question |
-| Multi-step questions ("all unsubmitted work over 20 points, every course") | Fast: one script, only the answer comes back | Slow: many tool calls, raw data fills the chat |
-| Simple questions ("my grade in THEO 13") | Still writes a small script | One direct tool call |
-| What you see while it works | A script; harder to follow | Named tool calls; easy to follow |
-| Works with weaker or smaller models | Less well: the model must write correct JavaScript | Better: the model only picks a tool |
-| Writes (submit, post, reply, comment, note) | Same individual, confirm-gated tools | Same |
-
-**Choose lean if** you use Claude (or another strong model), you can run
-`brew install deno`, and you want longer chats before hitting usage limits.
-This is the recommended setup.
-
-**Choose full if** you can't install Deno, you use a smaller model that
-writes code poorly, or you want to see each Canvas call by name. To switch,
-remove `--lean` from `args` and restart your client.
+Use `canvas_run_code` for reads after upgrading from an installation that
+called read tools directly. Existing launch commands with `--lean` still work.
 
 ## Course names instead of IDs
 
@@ -137,6 +109,11 @@ matches instead of guessing.
 | `canvas_post_discussion_entry` | Post a new top-level entry to a discussion | **Public to class** |
 | `canvas_reply_to_entry` | Reply to a specific discussion entry | **Public to class** |
 | `canvas_post_submission_comment` | Comment on your own submission (note to grader) | Medium |
+| `canvas_upload_file` | Upload a local file to Canvas course files | Changes course files |
+| `canvas_send_message` | Send a Canvas Inbox message | Sends to the recipients |
+
+`canvas_download_file` saves a file to `~/Downloads/Canvas` or your chosen
+folder. It leaves existing local files intact.
 
 `canvas_submit_assignment` supports `online_text_entry` (`body`), `online_url`
 (`url`), and `online_upload` (`local_paths` — files on this computer, uploaded
@@ -150,7 +127,7 @@ to the assignment only on the `confirm=true` call; `file_ids` also accepted).
   `curl -LsSf https://astral.sh/uv/install.sh | sh`
   (Windows: `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"`).
 - Install [Deno](https://deno.com) for Code Mode: `brew install deno`
-  (Windows: `winget install DenoLand.Deno`). Lean mode needs it.
+  (Windows: `winget install DenoLand.Deno`). Install it to read Canvas data.
 - In Canvas: **Account → Settings → Approved Integrations → + New Access Token**.
   Copy the token. Never paste it into a chat.
 
@@ -167,7 +144,7 @@ Add this (merge into `mcpServers` if the file already has servers):
   "mcpServers": {
     "canvas": {
       "command": "/Users/YOU/.local/bin/uvx",
-      "args": ["--from", "git+https://github.com/EZA2405/canvas-mcp", "canvas-mcp", "--lean"],
+      "args": ["--from", "git+https://github.com/EZA2405/canvas-mcp", "canvas-mcp"],
       "env": {
         "CANVAS_API_TOKEN": "PASTE_YOUR_TOKEN_HERE",
         "CANVAS_BASE_URL": "https://ateneo.instructure.com"
@@ -180,15 +157,50 @@ Add this (merge into `mcpServers` if the file already has servers):
 - Replace `/Users/YOU/.local/bin/uvx` with the output of `which uvx`
   (Windows: `where uvx`). Claude Desktop does not see your shell `PATH`.
 - Change `CANVAS_BASE_URL` if your school uses another Canvas instance.
-- `--lean` gives 9 tools (see Lean mode). Remove it for all 37.
 
 **Claude Code:**
 
 ```bash
-claude mcp add canvas -s user -e CANVAS_API_TOKEN=PASTE_YOUR_TOKEN_HERE -- uvx --from git+https://github.com/EZA2405/canvas-mcp canvas-mcp --lean
+claude mcp add canvas -s user -e CANVAS_API_TOKEN=PASTE_YOUR_TOKEN_HERE -- uvx --from git+https://github.com/EZA2405/canvas-mcp canvas-mcp
 ```
 
 **Update to the latest version:** `uv cache clean canvas-mcp`, then restart the client.
+
+### Optional token rotation on macOS or Linux
+
+Create a token for this MCP installation only. Give it an expiration date of
+30 days or less. Rotation requires a Canvas account that can create and delete
+personal tokens through the API. Scheduled rotation creates a
+replacement about every 20 days. It checks the new token before switching and
+removes the superseded token on a later run. Each token still has an expiration.
+
+Install the command and initialize a private token file. Replace
+`https://canvas.example.edu` with your Canvas site's HTTPS origin.
+
+```bash
+uv tool install git+https://github.com/EZA2405/canvas-mcp
+mkdir -p -m 700 "$HOME/.config/canvas-mcp"
+canvas-mcp-rotate "$HOME/.config/canvas-mcp/token.json" --init https://canvas.example.edu
+canvas-mcp-rotate "$HOME/.config/canvas-mcp/token.json" --check-only
+```
+
+Enter the dedicated Canvas token at the hidden terminal prompt. In your MCP
+client's environment settings, set `CANVAS_TOKEN_FILE` to the absolute path of
+that file and set `CANVAS_BASE_URL` to the same HTTPS origin. Remove
+`CANVAS_API_TOKEN` from that client entry and restart the client once.
+
+Schedule the command below once per day with your OS scheduler, such as
+`launchd` on macOS or `cron` on Linux. Use absolute paths in the scheduler.
+The command exits before contacting Canvas until rotation is due. The MCP
+client can be closed, and future token changes take effect on its next request.
+
+```text
+/ABSOLUTE/PATH/canvas-mcp-rotate /ABSOLUTE/PATH/token.json
+```
+
+After setup, `--rotate-now` attempts a rotation if there is no unexpired
+previous token awaiting removal. Use `--check-only` for a read-only check.
+Keep the token file out of repositories and shared folders.
 
 ### Developing locally
 
@@ -220,7 +232,8 @@ preview before ever setting `confirm=true`.
 
 | Env var | Required | Default |
 |---------|----------|---------|
-| `CANVAS_API_TOKEN` | yes | — |
+| `CANVAS_API_TOKEN` | if no token file is set | — |
+| `CANVAS_TOKEN_FILE` | no | — |
 | `CANVAS_BASE_URL` | no | `https://ateneo.instructure.com` |
 
 ## Notes

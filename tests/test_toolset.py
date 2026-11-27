@@ -28,21 +28,25 @@ class ToolsetTests(unittest.IsolatedAsyncioTestCase):
             "canvas_submit_assignment", "canvas_post_discussion_entry",
             "canvas_reply_to_entry", "canvas_post_submission_comment",
             "canvas_upload_file", "canvas_send_message"]))
-        self.assertEqual(len(exposed_tools("full")), len(canvas._TOOLS))
+        self.assertEqual(exposed_tools("full"), lean)
 
     def test_descriptions_drop_args_and_returns(self):
-        for name, desc in exposed_tools("full").items():
+        for name, desc in exposed_tools("").items():
             with self.subTest(name=name):
                 self.assertNotIn("Args:", desc)
                 self.assertNotIn("Returns:", desc)
                 self.assertTrue(desc)
+
+    def test_legacy_lean_flag_is_accepted(self):
+        subprocess.run([sys.executable, "canvas_mcp.py", "--lean", "--help"], cwd=ROOT,
+                       capture_output=True, check=True)
 
     async def test_scripts_reach_read_tools_not_exposed_in_lean(self):
         async def fake_get(path, params=None):
             return {"name": "Test Student", "id": 1}
 
         with patch.object(canvas, "_get", fake_get):
-            out = await canvas._code_tool("canvas_get_profile", {}, allow_writes=False)
+            out = await canvas._code_tool("canvas_get_profile", {})
         self.assertIn("Test Student", out)
 
 
